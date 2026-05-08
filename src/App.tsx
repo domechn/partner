@@ -129,7 +129,7 @@ function App() {
       setTranscript(finalText)
       const command = parseVoiceCommand(finalText)
       if (!command) {
-        setStatus('未识别到可执行命令，请说“点击这里 / 输入 xxx / 打开 xxx”。')
+        setStatus('未识别到可执行命令，请说“点击这里 / 输入 xxx / 打开 xxx”，或直接描述你想完成的目标。')
         return
       }
 
@@ -313,7 +313,7 @@ function App() {
     <main className="app-root">
       <header className="top-bar">
         <h1>Partner MVP</h1>
-        <p>本地运行 · 摄像头追踪 · 语音命令 · Electron 执行</p>
+          <p>本地运行 · 摄像头追踪 · 语音命令 · 自动拆解目标</p>
       </header>
 
       <section className="grid">
@@ -358,6 +358,12 @@ function App() {
             >
               切换 Tab
             </button>
+            <button
+              type="button"
+              onClick={() => void sendCommand({ kind: 'agent_task', goal: '帮我查一下今天的天气' })}
+            >
+              示例：自动查天气
+            </button>
           </div>
 
           <p className="status">状态：{status}</p>
@@ -367,10 +373,34 @@ function App() {
             <div className="confirm-box">
               <strong>待确认高风险操作</strong>
               <code>{JSON.stringify(pendingAction)}</code>
+              {lastResult?.plan && (
+                <ol className="plan-list">
+                  {lastResult.plan.map((step, index) => (
+                    <li key={`${step.description}-${index}`}>
+                      <span>{step.description}</span>
+                      <small>{step.risk === 'high' ? '需确认' : '低风险'}</small>
+                    </li>
+                  ))}
+                </ol>
+              )}
               <button type="button" onClick={() => void sendCommand({ kind: 'confirm_pending', confirmed: true })}>
                 确认执行
               </button>
             </div>
+          )}
+
+          {lastResult?.plan && !pendingAction && (
+            <section className="plan-card">
+              <h3>自动任务步骤</h3>
+              <ol className="plan-list">
+                {lastResult.plan.map((step, index) => (
+                  <li key={`${step.description}-${index}`}>
+                    <span>{step.description}</span>
+                    <small>{step.risk === 'high' ? '高风险' : '低风险'}</small>
+                  </li>
+                ))}
+              </ol>
+            </section>
           )}
 
           {lastResult && (

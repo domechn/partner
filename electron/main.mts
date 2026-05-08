@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { AutomationRequest, AutomationResult, GazePoint } from '../src/lib/intent.js'
+import type { AutomationAction, AutomationPlanStep, AutomationRequest, AutomationResult, GazePoint } from '../src/lib/intent.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -67,22 +67,36 @@ ipcMain.handle('gaze:update', (_event, point: GazePoint) => {
 })
 
 ipcMain.handle('automation:request', async (_event, request: AutomationRequest): Promise<AutomationResult> => {
-  if (riskyActions.has(request.kind) && !request.confirmed) {
-    pendingConfirmation = request
-    return {
-      ok: false,
-      requiresConfirmation: true,
-      message: '该操作风险较高，请说“确认执行”或点击确认。',
-      pendingAction: request,
-    }
-  }
-
   const activeWindow = mainWindow
   if (!activeWindow) {
     return { ok: false, message: '应用窗口不可用。' }
   }
 
   try {
+    if (request.kind === 'agent_task') {
+      const plan = createAgentPlan(request.goal)
+      if (plan.some((step) => step.risk === 'high') && !request.confirmed) {
+        pendingConfirmation = request
+        return {
+          ok: false,
+          requiresConfirmation: true,
+          message: '我已按目标拆解出执行计划，其中包含打开应用或链接等高风险动作，请确认后继续。',
+          pendingAction: request,
+          plan,
+        }
+      }
+    }
+
+    if (riskyActions.has(request.kind) && !request.confirmed) {
+      pendingConfirmation = request
+      return {
+        ok: false,
+        requiresConfirmation: true,
+        message: '该操作风险较高，请说“确认执行”或点击确认。',
+        pendingAction: request,
+      }
+    }
+
     if (request.kind === 'confirm_pending') {
       if (!pendingConfirmation) {
         return { ok: false, message: '当前没有待确认操作。' }
@@ -99,56 +113,270 @@ ipcMain.handle('automation:request', async (_event, request: AutomationRequest):
 })
 
 async function runAutomation(activeWindow: BrowserWindow, request: AutomationRequest): Promise<AutomationResult> {
+  const operator = new LocalComputerOperator(activeWindow, () => latestGaze)
+
   switch (request.kind) {
     case 'click_here': {
-      const [width, height] = activeWindow.getContentSize()
-      const x = Math.round(latestGaze.x * width)
-      const y = Math.round(latestGaze.y * height)
-
-      activeWindow.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
-      activeWindow.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
-
+      await operator.executeAction({ type: 'click' })
+      const { x, y } = operator.resolvePoint()
       return { ok: true, message: `已在窗口内注视点附近点击 (${x}, ${y})。` }
     }
     case 'type_text': {
-      const text = request.text.slice(0, 200)
+      const text = sanitizeTypedText(request.text)
       if (!text.trim()) {
         return { ok: false, message: '没有可输入的文本。' }
       }
-      activeWindow.webContents.insertText(text)
+      await operator.executeAction({ type: 'type', text })
       return { ok: true, message: `已输入: ${text}` }
     }
     case 'switch_tab': {
-      activeWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Control' })
-      activeWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Tab' })
-      activeWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Tab' })
-      activeWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Control' })
+      await operator.executeAction({ type: 'hotkey', keys: [platformShortcutKey(), 'Tab'] })
       return { ok: true, message: '已发送切换 tab 指令（Ctrl+Tab）。' }
     }
     case 'open_app': {
-      const appName = request.appName.trim()
-      if (appName.startsWith('http://') || appName.startsWith('https://')) {
-        await shell.openExternal(appName)
-        return { ok: true, message: `已打开链接: ${appName}` }
+      const target = request.appName.trim()
+      if (!isSafeOpenTarget(target)) {
+        return { ok: false, message: '应用名称或链接包含不安全字符，已拒绝执行。' }
+      }
+      await operator.executeAction({ type: 'open', target })
+      return { ok: true, message: `已尝试打开: ${target}` }
+    }
+    case 'agent_task': {
+      const plan = createAgentPlan(request.goal)
+      if (plan.length === 0) {
+        return { ok: false, message: '我还不能可靠拆解这个目标，请换一种更明确的说法。' }
       }
 
-      if (!/^[\w\s.-]{1,60}$/.test(appName)) {
-        return { ok: false, message: '应用名称包含不安全字符，已拒绝执行。' }
+      await operator.executePlan(plan)
+      return {
+        ok: true,
+        message: `已按“${request.goal}”执行 ${plan.length} 个步骤。`,
+        plan,
       }
-
-      if (process.platform === 'darwin') {
-        spawn('open', ['-a', appName], { detached: true, stdio: 'ignore' }).unref()
-      } else if (process.platform === 'win32') {
-        spawn('cmd', ['/c', 'start', '', appName], { detached: true, stdio: 'ignore' }).unref()
-      } else {
-        spawn(appName, [], { detached: true, stdio: 'ignore', shell: true }).unref()
-      }
-
-      return { ok: true, message: `已尝试打开: ${appName}` }
     }
     case 'confirm_pending':
       return { ok: false, message: '没有待执行确认动作。' }
     default:
       return { ok: false, message: '未识别动作。' }
   }
+}
+
+class LocalComputerOperator {
+  constructor(
+    private readonly activeWindow: BrowserWindow,
+    private readonly getGaze: () => GazePoint,
+  ) {}
+
+  resolvePoint(point = this.getGaze()): { x: number; y: number } {
+    const [width, height] = this.activeWindow.getContentSize()
+    return {
+      x: Math.round(Math.min(1, Math.max(0, point.x)) * width),
+      y: Math.round(Math.min(1, Math.max(0, point.y)) * height),
+    }
+  }
+
+  async executePlan(plan: AutomationPlanStep[]): Promise<void> {
+    for (const step of plan) {
+      await this.executeAction(step.action)
+    }
+  }
+
+  async executeAction(action: AutomationAction): Promise<void> {
+    switch (action.type) {
+      case 'click': {
+        const { x, y } = this.resolvePoint(action.point)
+        this.activeWindow.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+        this.activeWindow.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+        break
+      }
+      case 'type':
+        this.activeWindow.webContents.insertText(sanitizeTypedText(action.text))
+        break
+      case 'hotkey':
+        sendHotkey(this.activeWindow, action.keys)
+        break
+      case 'open':
+        await openTarget(action.target)
+        break
+      case 'wait':
+        await sleep(action.ms)
+        break
+      case 'finished':
+        break
+    }
+  }
+}
+
+function createAgentPlan(goal: string): AutomationPlanStep[] {
+  const trimmedGoal = goal.trim()
+  const normalized = trimmedGoal.toLowerCase()
+  if (!trimmedGoal) {
+    return []
+  }
+
+  if (/(切换|下一个|next).*(tab|标签)|switch tab/.test(normalized)) {
+    return [
+      {
+        action: { type: 'hotkey', keys: [platformShortcutKey(), 'Tab'] },
+        description: '根据目标切换到下一个标签页。',
+        risk: 'low',
+      },
+      {
+        action: { type: 'finished', reason: '已完成标签页切换。' },
+        description: '结束任务。',
+        risk: 'low',
+      },
+    ]
+  }
+
+  const typeMatch = trimmedGoal.match(/(?:输入|写下|填写|type)\s*[:：]?\s*(.+)/i)
+  if (typeMatch?.[1]) {
+    return [
+      {
+        action: { type: 'type', text: typeMatch[1].trim() },
+        description: '把用户给出的内容输入到当前焦点位置。',
+        risk: 'low',
+      },
+      {
+        action: { type: 'finished', reason: '已完成文本输入。' },
+        description: '结束任务。',
+        risk: 'low',
+      },
+    ]
+  }
+
+  const openTargetMatch = trimmedGoal.match(/(?:打开|启动|open|launch)\s+(.+)/i)
+  if (openTargetMatch?.[1]) {
+    return [
+      {
+        action: { type: 'open', target: openTargetMatch[1].trim() },
+        description: '打开用户目标中提到的应用或链接。',
+        risk: 'high',
+      },
+      {
+        action: { type: 'wait', ms: 800 },
+        description: '等待应用或链接响应。',
+        risk: 'low',
+      },
+      {
+        action: { type: 'finished', reason: '已尝试打开目标。' },
+        description: '结束任务。',
+        risk: 'low',
+      },
+    ]
+  }
+
+  if (/(查|找|搜|搜索|search|天气|weather|资料|信息)/.test(normalized)) {
+    const target = `https://www.google.com/search?q=${encodeURIComponent(trimmedGoal)}`
+    return [
+      {
+        action: { type: 'open', target },
+        description: '把模糊查询目标转成浏览器搜索。',
+        risk: 'high',
+      },
+      {
+        action: { type: 'wait', ms: 1000 },
+        description: '等待浏览器打开搜索结果。',
+        risk: 'low',
+      },
+      {
+        action: { type: 'finished', reason: '已打开搜索结果。' },
+        description: '结束任务。',
+        risk: 'low',
+      },
+    ]
+  }
+
+  return [
+    {
+      action: { type: 'click' },
+      description: '需求不明确时，先按当前注视点执行一次低风险点击。',
+      risk: 'low',
+    },
+    {
+      action: { type: 'finished', reason: '已执行基于注视点的默认动作。' },
+      description: '结束任务。',
+      risk: 'low',
+    },
+  ]
+}
+
+function sendHotkey(activeWindow: BrowserWindow, keys: string[]): void {
+  const normalizedKeys = keys.map(normalizeKey).filter((key) => key.length > 0)
+  if (normalizedKeys.length === 0) {
+    return
+  }
+
+  const modifiers = normalizedKeys.slice(0, -1)
+  const finalKey = normalizedKeys[normalizedKeys.length - 1]
+  for (const key of modifiers) {
+    activeWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: key })
+  }
+  activeWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: finalKey })
+  activeWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: finalKey })
+  for (const key of modifiers.reverse()) {
+    activeWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: key })
+  }
+}
+
+function normalizeKey(key: string): string {
+  const lower = key.toLowerCase()
+  const keyMap: Record<string, string> = {
+    command: 'Meta',
+    cmd: 'Meta',
+    meta: 'Meta',
+    control: 'Control',
+    ctrl: 'Control',
+    tab: 'Tab',
+    enter: 'Enter',
+    return: 'Enter',
+    shift: 'Shift',
+    alt: 'Alt',
+  }
+  return keyMap[lower] ?? key
+}
+
+function platformShortcutKey(): string {
+  return process.platform === 'darwin' ? 'Meta' : 'Control'
+}
+
+async function openTarget(target: string): Promise<void> {
+  if (!isSafeOpenTarget(target)) {
+    throw new Error('应用名称或链接包含不安全字符，已拒绝执行。')
+  }
+
+  if (target.startsWith('http://') || target.startsWith('https://')) {
+    await shell.openExternal(target)
+    return
+  }
+
+  if (process.platform === 'darwin') {
+    spawn('open', ['-a', target], { detached: true, stdio: 'ignore' }).unref()
+  } else if (process.platform === 'win32') {
+    spawn('cmd', ['/c', 'start', '', target], { detached: true, stdio: 'ignore' }).unref()
+  } else {
+    spawn(target, [], { detached: true, stdio: 'ignore' }).unref()
+  }
+}
+
+function isSafeOpenTarget(target: string): boolean {
+  if (target.startsWith('http://') || target.startsWith('https://')) {
+    try {
+      const parsed = new URL(target)
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+    } catch {
+      return false
+    }
+  }
+  return /^[\w\s.-]{1,60}$/.test(target)
+}
+
+function sanitizeTypedText(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').slice(0, 200)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.min(Math.max(ms, 0), 5000))
+  })
 }
