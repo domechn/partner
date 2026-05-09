@@ -1,8 +1,24 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, ipcMain, shell, screen } from "electron";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createConversationManager } from "./conversation/manager.js";
+import {
+  createLocalTtsPlayer,
+  splitTextForSpeech,
+} from "./conversation/localTts.js";
+import { resolveOllamaAutomationRequest } from "./conversation/automationProposal.js";
+import { buildConversationSystemPrompt } from "./conversation/gazeContext.js";
+import { streamOllamaChatReply } from "./conversation/ollamaClient.js";
+import {
+  buildGazeOverlayHtml,
+  resolveGazeOverlayPoint,
+} from "./gazeOverlay.js";
+import type {
+  ConversationUpdate,
+  RendererConversationEvent,
+} from "../src/lib/conversation.js";
 import type {
   AutomationAction,
   AutomationPlanStep,
@@ -15,12 +31,61 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 let mainWindow: BrowserWindow | null = null;
+let gazeOverlayWindow: BrowserWindow | null = null;
 let latestGaze: GazePoint = { x: 0.5, y: 0.5 };
 let pendingConfirmation: AutomationRequest | null = null;
+let ttsRemainder = "";
+
+const conversationConfig = {
+  baseUrl: process.env.PARTNER_OLLAMA_BASE_URL || "http://127.0.0.1:11434",
+  model: process.env.PARTNER_OLLAMA_MODEL || "qwen2.5:7b",
+  allowInstalledModelFallback: !process.env.PARTNER_OLLAMA_MODEL,
+  systemPrompt:
+    process.env.PARTNER_SYSTEM_PROMPT ||
+    [
+      "你是 Partner 的本地语音助手。",
+      "默认使用简洁中文回答。",
+      "当前版本先专注于实时对话；涉及电脑操作时先解释意图，不要假装已经执行。",
+      "如果上下文不足，就先追问一个最小澄清问题。",
+    ].join(""),
+};
+
+const conversationManager = createConversationManager({
+  createReplyStream: ({ snapshot }, signal) =>
+    streamOllamaChatReply(snapshot, {
+      ...conversationConfig,
+      systemPrompt: buildConversationSystemPrompt(
+        conversationConfig.systemPrompt,
+        latestGaze,
+      ),
+      signal,
+      allowLocalReplyFallback: true,
+    }),
+  createAutomationProposal: async ({ snapshot }) => {
+    const request = await resolveOllamaAutomationRequest(snapshot, {
+      model: conversationConfig.model,
+      baseUrl: conversationConfig.baseUrl,
+      gaze: latestGaze,
+    });
+
+    return buildConversationConfirmation(request);
+  },
+});
+
+const ttsPlayer = createLocalTtsPlayer({
+  onError: (error) => {
+    console.error("Partner local TTS failed:", error);
+  },
+});
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
 
 const riskyActions = new Set<AutomationRequest["kind"]>(["open_app"]);
+
+conversationManager.onUpdate((update) => {
+  mainWindow?.webContents.send("conversation:update", update);
+  handleConversationTts(update);
+});
 
 const verifyPartnerBridge = async (window: BrowserWindow) => {
   const hasPartnerBridge = await window.webContents.executeJavaScript(
@@ -48,6 +113,11 @@ const createWindow = async () => {
     },
   });
 
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+    closeGazeOverlayWindow();
+  });
+
   if (isDev && process.env.VITE_DEV_SERVER_URL) {
     await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
     await verifyPartnerBridge(mainWindow);
@@ -62,12 +132,57 @@ const createWindow = async () => {
   }
 };
 
+const createGazeOverlayWindow = async () => {
+  if (process.env.PARTNER_GAZE_OVERLAY === "0") {
+    return;
+  }
+
+  if (gazeOverlayWindow && !gazeOverlayWindow.isDestroyed()) {
+    return;
+  }
+
+  const bounds = screen.getPrimaryDisplay().bounds;
+  gazeOverlayWindow = new BrowserWindow({
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    transparent: true,
+    frame: false,
+    resizable: false,
+    movable: false,
+    focusable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    alwaysOnTop: true,
+    title: "Partner Gaze Overlay",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  gazeOverlayWindow.setIgnoreMouseEvents(true, { forward: true });
+  gazeOverlayWindow.setAlwaysOnTop(true, "screen-saver");
+  gazeOverlayWindow.on("closed", () => {
+    gazeOverlayWindow = null;
+  });
+
+  await gazeOverlayWindow.loadURL(
+    `data:text/html;charset=utf-8,${encodeURIComponent(buildGazeOverlayHtml())}`,
+  );
+  updateGazeOverlayWindow(latestGaze);
+};
+
 app.whenReady().then(async () => {
   await createWindow();
+  await createGazeOverlayWindow();
 
   app.on("activate", async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       await createWindow();
+      await createGazeOverlayWindow();
     }
   });
 });
@@ -79,11 +194,82 @@ app.on("window-all-closed", () => {
 });
 
 ipcMain.handle("gaze:update", (_event, point: GazePoint) => {
-  latestGaze = {
-    x: Math.min(1, Math.max(0, point.x)),
-    y: Math.min(1, Math.max(0, point.y)),
-  };
+  latestGaze = normalizeGazePoint(point);
+  updateGazeOverlayWindow(latestGaze);
 });
+
+ipcMain.handle("conversation:get-snapshot", () => {
+  return conversationManager.getSnapshot();
+});
+
+ipcMain.handle("conversation:start", () => {
+  return conversationManager.startSession();
+});
+
+ipcMain.handle("conversation:stop", (_event, reason?: string) => {
+  ttsRemainder = "";
+  void ttsPlayer.stop(reason);
+  return conversationManager.stopSession(reason);
+});
+
+ipcMain.handle("conversation:submit-turn", (_event, text: string) => {
+  const snapshot = conversationManager.submitUserTurn(text);
+  void conversationManager.streamAssistantReply();
+  return snapshot;
+});
+
+ipcMain.handle("conversation:interrupt", (_event, reason?: string) => {
+  ttsRemainder = "";
+  void ttsPlayer.stop(reason);
+  return conversationManager.interruptConversation(reason);
+});
+
+ipcMain.handle(
+  "conversation:confirm-action",
+  async (): Promise<AutomationResult> => {
+    const activeWindow = mainWindow;
+    if (!activeWindow) {
+      return { ok: false, message: "应用窗口不可用。" };
+    }
+
+    const pendingConfirmation =
+      conversationManager.getSnapshot().pendingConfirmation;
+    if (!pendingConfirmation) {
+      return { ok: false, message: "当前没有待确认的会话动作。" };
+    }
+
+    conversationManager.clearConfirmation();
+
+    try {
+      return await runAutomation(activeWindow, {
+        ...pendingConfirmation.request,
+        confirmed: true,
+      } as AutomationRequest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "执行失败";
+      return { ok: false, message };
+    }
+  },
+);
+
+ipcMain.handle("conversation:clear-confirmation", () => {
+  return conversationManager.clearConfirmation();
+});
+
+ipcMain.handle(
+  "conversation:dispatch-event",
+  (_event, event: RendererConversationEvent) => {
+    if (
+      event.type !== "user.speech.started" &&
+      event.type !== "user.transcription.started" &&
+      event.type !== "user.turn.discarded"
+    ) {
+      throw new Error("Renderer conversation event is not allowed.");
+    }
+
+    return conversationManager.dispatch(event);
+  },
+);
 
 ipcMain.handle(
   "automation:request",
@@ -437,6 +623,105 @@ function sanitizeTypedText(text: string): string {
   return text
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
     .slice(0, 200);
+}
+
+function buildConversationConfirmation(request: AutomationRequest | null) {
+  if (!request) {
+    return null;
+  }
+
+  switch (request.kind) {
+    case "click_here":
+      return {
+        request,
+        message: "我理解为要在当前注视点附近点击；确认后才会执行。",
+      };
+    case "switch_tab":
+      return {
+        request,
+        message: "我理解为要切换到下一个标签页；确认后才会执行。",
+      };
+    case "type_text":
+      return {
+        request,
+        message: `我理解为要输入文本“${request.text}”；确认后才会执行。`,
+      };
+    case "open_app":
+      return {
+        request,
+        message: `我理解为要打开“${request.appName}”；确认后才会执行。`,
+      };
+    case "agent_task":
+      return {
+        request,
+        message: `我理解为要执行“${request.goal}”；确认后才会开始操作。`,
+        plan: createAgentPlan(request.goal),
+      };
+    case "confirm_pending":
+      return null;
+    default:
+      return null;
+  }
+}
+
+function handleConversationTts(update: ConversationUpdate): void {
+  switch (update.event.type) {
+    case "assistant.turn.delta": {
+      const next = splitTextForSpeech(`${ttsRemainder}${update.event.delta}`);
+      ttsRemainder = next.remainder;
+      for (const chunk of next.chunks) {
+        ttsPlayer.enqueue(chunk);
+      }
+      break;
+    }
+    case "assistant.turn.completed": {
+      if (ttsRemainder.trim()) {
+        ttsPlayer.enqueue(ttsRemainder);
+      }
+      ttsRemainder = "";
+      break;
+    }
+    case "assistant.turn.failed":
+    case "assistant.turn.interrupted":
+    case "session.started":
+    case "session.stopped":
+    case "user.speech.started": {
+      ttsRemainder = "";
+      void ttsPlayer.stop(update.event.type);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function normalizeGazePoint(point: GazePoint): GazePoint {
+  return {
+    x: Math.min(1, Math.max(0, point.x)),
+    y: Math.min(1, Math.max(0, point.y)),
+  };
+}
+
+function updateGazeOverlayWindow(gaze: GazePoint): void {
+  const overlayWindow = gazeOverlayWindow;
+  if (!overlayWindow || overlayWindow.isDestroyed()) {
+    return;
+  }
+
+  const point = resolveGazeOverlayPoint(gaze, overlayWindow.getBounds());
+  const script = `window.partnerSetGaze(${JSON.stringify(point)})`;
+  void overlayWindow.webContents.executeJavaScript(script, true).catch(() => {
+    // The overlay may still be loading or already closing; the next gaze tick will retry.
+  });
+}
+
+function closeGazeOverlayWindow(): void {
+  const overlayWindow = gazeOverlayWindow;
+  gazeOverlayWindow = null;
+
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.close();
+  }
 }
 
 function sleep(ms: number): Promise<void> {
