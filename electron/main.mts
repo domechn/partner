@@ -1,20 +1,37 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron'
-import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-import type { AutomationAction, AutomationPlanStep, AutomationRequest, AutomationResult, GazePoint } from '../src/lib/intent.js'
+import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type {
+  AutomationAction,
+  AutomationPlanStep,
+  AutomationRequest,
+  AutomationResult,
+  GazePoint,
+} from "../src/lib/intent.js";
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-let mainWindow: BrowserWindow | null = null
-let latestGaze: GazePoint = { x: 0.5, y: 0.5 }
-let pendingConfirmation: AutomationRequest | null = null
+let mainWindow: BrowserWindow | null = null;
+let latestGaze: GazePoint = { x: 0.5, y: 0.5 };
+let pendingConfirmation: AutomationRequest | null = null;
 
-const isDev = !!process.env.VITE_DEV_SERVER_URL
+const isDev = !!process.env.VITE_DEV_SERVER_URL;
 
-const riskyActions = new Set<AutomationRequest['kind']>(['open_app'])
+const riskyActions = new Set<AutomationRequest["kind"]>(["open_app"]);
+
+const verifyPartnerBridge = async (window: BrowserWindow) => {
+  const hasPartnerBridge = await window.webContents.executeJavaScript(
+    'typeof window.partner === "object" && window.partner !== null',
+    true,
+  );
+
+  if (!hasPartnerBridge) {
+    console.error("Partner preload API is unavailable in renderer.");
+  }
+};
 
 const createWindow = async () => {
   mainWindow = new BrowserWindow({
@@ -22,142 +39,163 @@ const createWindow = async () => {
     height: 860,
     minWidth: 980,
     minHeight: 700,
-    title: 'Partner MVP',
+    title: "Partner MVP",
     webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: path.join(__dirname, "preload.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true,
+      sandbox: false,
     },
-  })
+  });
 
   if (isDev && process.env.VITE_DEV_SERVER_URL) {
-    await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
-    mainWindow.webContents.openDevTools({ mode: 'detach' })
-    return
+    await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+    await verifyPartnerBridge(mainWindow);
+    mainWindow.webContents.openDevTools({ mode: "detach" });
+    return;
   }
 
-  const indexPath = path.join(__dirname, '../dist/index.html')
+  const indexPath = path.join(__dirname, "../../dist/index.html");
   if (existsSync(indexPath)) {
-    await mainWindow.loadFile(indexPath)
+    await mainWindow.loadFile(indexPath);
+    await verifyPartnerBridge(mainWindow);
   }
-}
+};
 
 app.whenReady().then(async () => {
-  await createWindow()
+  await createWindow();
 
-  app.on('activate', async () => {
+  app.on("activate", async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      await createWindow()
+      await createWindow();
     }
-  })
-})
+  });
+});
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
+    app.quit();
   }
-})
+});
 
-ipcMain.handle('gaze:update', (_event, point: GazePoint) => {
+ipcMain.handle("gaze:update", (_event, point: GazePoint) => {
   latestGaze = {
     x: Math.min(1, Math.max(0, point.x)),
     y: Math.min(1, Math.max(0, point.y)),
-  }
-})
+  };
+});
 
-ipcMain.handle('automation:request', async (_event, request: AutomationRequest): Promise<AutomationResult> => {
-  const activeWindow = mainWindow
-  if (!activeWindow) {
-    return { ok: false, message: '应用窗口不可用。' }
-  }
+ipcMain.handle(
+  "automation:request",
+  async (_event, request: AutomationRequest): Promise<AutomationResult> => {
+    const activeWindow = mainWindow;
+    if (!activeWindow) {
+      return { ok: false, message: "应用窗口不可用。" };
+    }
 
-  try {
-    if (request.kind === 'agent_task') {
-      const plan = createAgentPlan(request.goal)
-      if (plan.some((step) => step.risk === 'high') && !request.confirmed) {
-        pendingConfirmation = request
+    try {
+      if (request.kind === "agent_task") {
+        const plan = createAgentPlan(request.goal);
+        if (plan.some((step) => step.risk === "high") && !request.confirmed) {
+          pendingConfirmation = request;
+          return {
+            ok: false,
+            requiresConfirmation: true,
+            message:
+              "我已按目标拆解出执行计划，其中包含打开应用或链接等高风险动作，请确认后继续。",
+            pendingAction: request,
+            plan,
+          };
+        }
+      }
+
+      if (riskyActions.has(request.kind) && !request.confirmed) {
+        pendingConfirmation = request;
         return {
           ok: false,
           requiresConfirmation: true,
-          message: '我已按目标拆解出执行计划，其中包含打开应用或链接等高风险动作，请确认后继续。',
+          message: "该操作风险较高，请说“确认执行”或点击确认。",
           pendingAction: request,
-          plan,
+        };
+      }
+
+      if (request.kind === "confirm_pending") {
+        if (!pendingConfirmation) {
+          return { ok: false, message: "当前没有待确认操作。" };
         }
+        const toRun = {
+          ...pendingConfirmation,
+          confirmed: true,
+        } as AutomationRequest;
+        pendingConfirmation = null;
+        return runAutomation(activeWindow, toRun);
       }
+      return runAutomation(activeWindow, request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "执行失败";
+      return { ok: false, message };
     }
+  },
+);
 
-    if (riskyActions.has(request.kind) && !request.confirmed) {
-      pendingConfirmation = request
-      return {
-        ok: false,
-        requiresConfirmation: true,
-        message: '该操作风险较高，请说“确认执行”或点击确认。',
-        pendingAction: request,
-      }
-    }
-
-    if (request.kind === 'confirm_pending') {
-      if (!pendingConfirmation) {
-        return { ok: false, message: '当前没有待确认操作。' }
-      }
-      const toRun = { ...pendingConfirmation, confirmed: true } as AutomationRequest
-      pendingConfirmation = null
-      return runAutomation(activeWindow, toRun)
-    }
-    return runAutomation(activeWindow, request)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : '执行失败'
-    return { ok: false, message }
-  }
-})
-
-async function runAutomation(activeWindow: BrowserWindow, request: AutomationRequest): Promise<AutomationResult> {
-  const operator = new LocalComputerOperator(activeWindow, () => latestGaze)
+async function runAutomation(
+  activeWindow: BrowserWindow,
+  request: AutomationRequest,
+): Promise<AutomationResult> {
+  const operator = new LocalComputerOperator(activeWindow, () => latestGaze);
 
   switch (request.kind) {
-    case 'click_here': {
-      await operator.executeAction({ type: 'click' })
-      const { x, y } = operator.resolvePoint()
-      return { ok: true, message: `已在窗口内注视点附近点击 (${x}, ${y})。` }
+    case "click_here": {
+      await operator.executeAction({ type: "click" });
+      const { x, y } = operator.resolvePoint();
+      return { ok: true, message: `已在窗口内注视点附近点击 (${x}, ${y})。` };
     }
-    case 'type_text': {
-      const text = sanitizeTypedText(request.text)
+    case "type_text": {
+      const text = sanitizeTypedText(request.text);
       if (!text.trim()) {
-        return { ok: false, message: '没有可输入的文本。' }
+        return { ok: false, message: "没有可输入的文本。" };
       }
-      await operator.executeAction({ type: 'type', text })
-      return { ok: true, message: `已输入: ${text}` }
+      await operator.executeAction({ type: "type", text });
+      return { ok: true, message: `已输入: ${text}` };
     }
-    case 'switch_tab': {
-      await operator.executeAction({ type: 'hotkey', keys: [platformShortcutKey(), 'Tab'] })
-      return { ok: true, message: '已发送切换 tab 指令（Ctrl+Tab）。' }
+    case "switch_tab": {
+      await operator.executeAction({
+        type: "hotkey",
+        keys: [platformShortcutKey(), "Tab"],
+      });
+      return { ok: true, message: "已发送切换 tab 指令（Ctrl+Tab）。" };
     }
-    case 'open_app': {
-      const target = request.appName.trim()
+    case "open_app": {
+      const target = request.appName.trim();
       if (!isSafeOpenTarget(target)) {
-        return { ok: false, message: '应用名称或链接包含不安全字符，已拒绝执行。' }
+        return {
+          ok: false,
+          message: "应用名称或链接包含不安全字符，已拒绝执行。",
+        };
       }
-      await operator.executeAction({ type: 'open', target })
-      return { ok: true, message: `已尝试打开: ${target}` }
+      await operator.executeAction({ type: "open", target });
+      return { ok: true, message: `已尝试打开: ${target}` };
     }
-    case 'agent_task': {
-      const plan = createAgentPlan(request.goal)
+    case "agent_task": {
+      const plan = createAgentPlan(request.goal);
       if (plan.length === 0) {
-        return { ok: false, message: '我还不能可靠拆解这个目标，请换一种更明确的说法。' }
+        return {
+          ok: false,
+          message: "我还不能可靠拆解这个目标，请换一种更明确的说法。",
+        };
       }
 
-      await operator.executePlan(plan)
+      await operator.executePlan(plan);
       return {
         ok: true,
         message: `已按“${request.goal}”执行 ${plan.length} 个步骤。`,
         plan,
-      }
+      };
     }
-    case 'confirm_pending':
-      return { ok: false, message: '没有待执行确认动作。' }
+    case "confirm_pending":
+      return { ok: false, message: "没有待执行确认动作。" };
     default:
-      return { ok: false, message: '未识别动作。' }
+      return { ok: false, message: "未识别动作。" };
   }
 }
 
@@ -168,215 +206,241 @@ class LocalComputerOperator {
   ) {}
 
   resolvePoint(point = this.getGaze()): { x: number; y: number } {
-    const [width, height] = this.activeWindow.getContentSize()
+    const [width, height] = this.activeWindow.getContentSize();
     return {
       x: Math.round(Math.min(1, Math.max(0, point.x)) * width),
       y: Math.round(Math.min(1, Math.max(0, point.y)) * height),
-    }
+    };
   }
 
   async executePlan(plan: AutomationPlanStep[]): Promise<void> {
     for (const step of plan) {
-      await this.executeAction(step.action)
+      await this.executeAction(step.action);
     }
   }
 
   async executeAction(action: AutomationAction): Promise<void> {
     switch (action.type) {
-      case 'click': {
-        const { x, y } = this.resolvePoint(action.point)
-        this.activeWindow.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
-        this.activeWindow.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
-        break
+      case "click": {
+        const { x, y } = this.resolvePoint(action.point);
+        this.activeWindow.webContents.sendInputEvent({
+          type: "mouseDown",
+          x,
+          y,
+          button: "left",
+          clickCount: 1,
+        });
+        this.activeWindow.webContents.sendInputEvent({
+          type: "mouseUp",
+          x,
+          y,
+          button: "left",
+          clickCount: 1,
+        });
+        break;
       }
-      case 'type':
-        this.activeWindow.webContents.insertText(sanitizeTypedText(action.text))
-        break
-      case 'hotkey':
-        sendHotkey(this.activeWindow, action.keys)
-        break
-      case 'open':
-        await openTarget(action.target)
-        break
-      case 'wait':
-        await sleep(action.ms)
-        break
-      case 'finished':
-        break
+      case "type":
+        this.activeWindow.webContents.insertText(
+          sanitizeTypedText(action.text),
+        );
+        break;
+      case "hotkey":
+        sendHotkey(this.activeWindow, action.keys);
+        break;
+      case "open":
+        await openTarget(action.target);
+        break;
+      case "wait":
+        await sleep(action.ms);
+        break;
+      case "finished":
+        break;
     }
   }
 }
 
 function createAgentPlan(goal: string): AutomationPlanStep[] {
-  const trimmedGoal = goal.trim()
-  const normalized = trimmedGoal.toLowerCase()
+  const trimmedGoal = goal.trim();
+  const normalized = trimmedGoal.toLowerCase();
   if (!trimmedGoal) {
-    return []
+    return [];
   }
 
   if (/(切换|下一个|next).*(tab|标签)|switch tab/.test(normalized)) {
     return [
       {
-        action: { type: 'hotkey', keys: [platformShortcutKey(), 'Tab'] },
-        description: '根据目标切换到下一个标签页。',
-        risk: 'low',
+        action: { type: "hotkey", keys: [platformShortcutKey(), "Tab"] },
+        description: "根据目标切换到下一个标签页。",
+        risk: "low",
       },
       {
-        action: { type: 'finished', reason: '已完成标签页切换。' },
-        description: '结束任务。',
-        risk: 'low',
+        action: { type: "finished", reason: "已完成标签页切换。" },
+        description: "结束任务。",
+        risk: "low",
       },
-    ]
+    ];
   }
 
-  const typeMatch = trimmedGoal.match(/(?:输入|写下|填写|type)\s*[:：]?\s*(.+)/i)
+  const typeMatch = trimmedGoal.match(
+    /(?:输入|写下|填写|type)\s*[:：]?\s*(.+)/i,
+  );
   if (typeMatch?.[1]) {
     return [
       {
-        action: { type: 'type', text: typeMatch[1].trim() },
-        description: '把用户给出的内容输入到当前焦点位置。',
-        risk: 'low',
+        action: { type: "type", text: typeMatch[1].trim() },
+        description: "把用户给出的内容输入到当前焦点位置。",
+        risk: "low",
       },
       {
-        action: { type: 'finished', reason: '已完成文本输入。' },
-        description: '结束任务。',
-        risk: 'low',
+        action: { type: "finished", reason: "已完成文本输入。" },
+        description: "结束任务。",
+        risk: "low",
       },
-    ]
+    ];
   }
 
-  const openTargetMatch = trimmedGoal.match(/(?:打开|启动|open|launch)\s+(.+)/i)
+  const openTargetMatch = trimmedGoal.match(
+    /(?:打开|启动|open|launch)\s+(.+)/i,
+  );
   if (openTargetMatch?.[1]) {
     return [
       {
-        action: { type: 'open', target: openTargetMatch[1].trim() },
-        description: '打开用户目标中提到的应用或链接。',
-        risk: 'high',
+        action: { type: "open", target: openTargetMatch[1].trim() },
+        description: "打开用户目标中提到的应用或链接。",
+        risk: "high",
       },
       {
-        action: { type: 'wait', ms: 800 },
-        description: '等待应用或链接响应。',
-        risk: 'low',
+        action: { type: "wait", ms: 800 },
+        description: "等待应用或链接响应。",
+        risk: "low",
       },
       {
-        action: { type: 'finished', reason: '已尝试打开目标。' },
-        description: '结束任务。',
-        risk: 'low',
+        action: { type: "finished", reason: "已尝试打开目标。" },
+        description: "结束任务。",
+        risk: "low",
       },
-    ]
+    ];
   }
 
   if (/(查|找|搜|搜索|search|天气|weather|资料|信息)/.test(normalized)) {
-    const target = `https://www.google.com/search?q=${encodeURIComponent(trimmedGoal)}`
+    const target = `https://www.google.com/search?q=${encodeURIComponent(trimmedGoal)}`;
     return [
       {
-        action: { type: 'open', target },
-        description: '把模糊查询目标转成浏览器搜索。',
-        risk: 'high',
+        action: { type: "open", target },
+        description: "把模糊查询目标转成浏览器搜索。",
+        risk: "high",
       },
       {
-        action: { type: 'wait', ms: 1000 },
-        description: '等待浏览器打开搜索结果。',
-        risk: 'low',
+        action: { type: "wait", ms: 1000 },
+        description: "等待浏览器打开搜索结果。",
+        risk: "low",
       },
       {
-        action: { type: 'finished', reason: '已打开搜索结果。' },
-        description: '结束任务。',
-        risk: 'low',
+        action: { type: "finished", reason: "已打开搜索结果。" },
+        description: "结束任务。",
+        risk: "low",
       },
-    ]
+    ];
   }
 
   return [
     {
-      action: { type: 'click' },
-      description: '需求不明确时，先按当前注视点执行一次低风险点击。',
-      risk: 'low',
+      action: { type: "click" },
+      description: "需求不明确时，先按当前注视点执行一次低风险点击。",
+      risk: "low",
     },
     {
-      action: { type: 'finished', reason: '已执行基于注视点的默认动作。' },
-      description: '结束任务。',
-      risk: 'low',
+      action: { type: "finished", reason: "已执行基于注视点的默认动作。" },
+      description: "结束任务。",
+      risk: "low",
     },
-  ]
+  ];
 }
 
 function sendHotkey(activeWindow: BrowserWindow, keys: string[]): void {
-  const normalizedKeys = keys.map(normalizeKey).filter((key) => key.length > 0)
+  const normalizedKeys = keys.map(normalizeKey).filter((key) => key.length > 0);
   if (normalizedKeys.length === 0) {
-    return
+    return;
   }
 
-  const modifiers = normalizedKeys.slice(0, -1)
-  const finalKey = normalizedKeys[normalizedKeys.length - 1]
+  const modifiers = normalizedKeys.slice(0, -1);
+  const finalKey = normalizedKeys[normalizedKeys.length - 1];
   for (const key of modifiers) {
-    activeWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: key })
+    activeWindow.webContents.sendInputEvent({ type: "keyDown", keyCode: key });
   }
-  activeWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: finalKey })
-  activeWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: finalKey })
+  activeWindow.webContents.sendInputEvent({
+    type: "keyDown",
+    keyCode: finalKey,
+  });
+  activeWindow.webContents.sendInputEvent({ type: "keyUp", keyCode: finalKey });
   for (const key of modifiers.reverse()) {
-    activeWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: key })
+    activeWindow.webContents.sendInputEvent({ type: "keyUp", keyCode: key });
   }
 }
 
 function normalizeKey(key: string): string {
-  const lower = key.toLowerCase()
+  const lower = key.toLowerCase();
   const keyMap: Record<string, string> = {
-    command: 'Meta',
-    cmd: 'Meta',
-    meta: 'Meta',
-    control: 'Control',
-    ctrl: 'Control',
-    tab: 'Tab',
-    enter: 'Enter',
-    return: 'Enter',
-    shift: 'Shift',
-    alt: 'Alt',
-  }
-  return keyMap[lower] ?? key
+    command: "Meta",
+    cmd: "Meta",
+    meta: "Meta",
+    control: "Control",
+    ctrl: "Control",
+    tab: "Tab",
+    enter: "Enter",
+    return: "Enter",
+    shift: "Shift",
+    alt: "Alt",
+  };
+  return keyMap[lower] ?? key;
 }
 
 function platformShortcutKey(): string {
-  return process.platform === 'darwin' ? 'Meta' : 'Control'
+  return process.platform === "darwin" ? "Meta" : "Control";
 }
 
 async function openTarget(target: string): Promise<void> {
   if (!isSafeOpenTarget(target)) {
-    throw new Error('应用名称或链接包含不安全字符，已拒绝执行。')
+    throw new Error("应用名称或链接包含不安全字符，已拒绝执行。");
   }
 
-  if (target.startsWith('http://') || target.startsWith('https://')) {
-    await shell.openExternal(target)
-    return
+  if (target.startsWith("http://") || target.startsWith("https://")) {
+    await shell.openExternal(target);
+    return;
   }
 
-  if (process.platform === 'darwin') {
-    spawn('open', ['-a', target], { detached: true, stdio: 'ignore' }).unref()
-  } else if (process.platform === 'win32') {
-    spawn('cmd', ['/c', 'start', '', target], { detached: true, stdio: 'ignore' }).unref()
+  if (process.platform === "darwin") {
+    spawn("open", ["-a", target], { detached: true, stdio: "ignore" }).unref();
+  } else if (process.platform === "win32") {
+    spawn("cmd", ["/c", "start", "", target], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
   } else {
-    spawn(target, [], { detached: true, stdio: 'ignore' }).unref()
+    spawn(target, [], { detached: true, stdio: "ignore" }).unref();
   }
 }
 
 function isSafeOpenTarget(target: string): boolean {
-  if (target.startsWith('http://') || target.startsWith('https://')) {
+  if (target.startsWith("http://") || target.startsWith("https://")) {
     try {
-      const parsed = new URL(target)
-      return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+      const parsed = new URL(target);
+      return parsed.protocol === "http:" || parsed.protocol === "https:";
     } catch {
-      return false
+      return false;
     }
   }
-  return /^[\w\s.-]{1,60}$/.test(target)
+  return /^[\w\s.-]{1,60}$/.test(target);
 }
 
 function sanitizeTypedText(text: string): string {
-  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').slice(0, 200)
+  return text
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .slice(0, 200);
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    setTimeout(resolve, Math.min(Math.max(ms, 0), 5000))
-  })
+    setTimeout(resolve, Math.min(Math.max(ms, 0), 5000));
+  });
 }
