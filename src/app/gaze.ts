@@ -31,33 +31,25 @@ export function mapWithCalibration(
     return raw;
   }
 
-  const xRangeRaw =
-    Math.max(...samples.map((sample) => sample.raw.x)) -
-    Math.min(...samples.map((sample) => sample.raw.x));
-  const yRangeRaw =
-    Math.max(...samples.map((sample) => sample.raw.y)) -
-    Math.min(...samples.map((sample) => sample.raw.y));
-
-  const xRangeTarget =
-    Math.max(...samples.map((sample) => sample.target.x)) -
-    Math.min(...samples.map((sample) => sample.target.x));
-  const yRangeTarget =
-    Math.max(...samples.map((sample) => sample.target.y)) -
-    Math.min(...samples.map((sample) => sample.target.y));
-
-  if (xRangeRaw <= 0.001 || yRangeRaw <= 0.001) {
-    return raw;
+  const affineCalibration = solveAffineCalibration(samples);
+  if (affineCalibration) {
+    return {
+      x: clamp(applyAffine(raw, affineCalibration.x)),
+      y: clamp(applyAffine(raw, affineCalibration.y)),
+    };
   }
 
-  const xMinRaw = Math.min(...samples.map((sample) => sample.raw.x));
-  const yMinRaw = Math.min(...samples.map((sample) => sample.raw.y));
-  const xMinTarget = Math.min(...samples.map((sample) => sample.target.x));
-  const yMinTarget = Math.min(...samples.map((sample) => sample.target.y));
+  const xAxis = solveAxisCalibration(
+    samples.map((sample) => ({ raw: sample.raw.x, target: sample.target.x })),
+  );
+  const yAxis = solveAxisCalibration(
+    samples.map((sample) => ({ raw: sample.raw.y, target: sample.target.y })),
+  );
 
-  const x = ((raw.x - xMinRaw) / xRangeRaw) * xRangeTarget + xMinTarget;
-  const y = ((raw.y - yMinRaw) / yRangeRaw) * yRangeTarget + yMinTarget;
-
-  return { x: clamp(x), y: clamp(y) };
+  return {
+    x: clamp(xAxis ? applyAxis(raw.x, xAxis) : raw.x),
+    y: clamp(yAxis ? applyAxis(raw.y, yAxis) : raw.y),
+  };
 }
 
 export function getCurrentCalibrationPoint(step: number): GazePoint {
@@ -137,4 +129,145 @@ function measureEyeGaze(
 
 function average(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+type AxisCalibration = {
+  slope: number;
+  intercept: number;
+};
+
+type AffineCoefficients = readonly [number, number, number];
+
+type AffineCalibration = {
+  x: AffineCoefficients;
+  y: AffineCoefficients;
+};
+
+function solveAxisCalibration(
+  points: Array<{ raw: number; target: number }>,
+): AxisCalibration | null {
+  const rawMean = average(points.map((point) => point.raw));
+  const targetMean = average(points.map((point) => point.target));
+  let numerator = 0;
+  let denominator = 0;
+
+  for (const point of points) {
+    const rawDelta = point.raw - rawMean;
+    numerator += rawDelta * (point.target - targetMean);
+    denominator += rawDelta * rawDelta;
+  }
+
+  if (denominator <= 0.000001) {
+    return null;
+  }
+
+  const slope = numerator / denominator;
+  return {
+    slope,
+    intercept: targetMean - slope * rawMean,
+  };
+}
+
+function applyAxis(raw: number, calibration: AxisCalibration): number {
+  return calibration.slope * raw + calibration.intercept;
+}
+
+function solveAffineCalibration(
+  samples: CalibrationSample[],
+): AffineCalibration | null {
+  if (samples.length < 3) {
+    return null;
+  }
+
+  const x = solveAffineAxis(samples, (sample) => sample.target.x);
+  const y = solveAffineAxis(samples, (sample) => sample.target.y);
+  if (!x || !y) {
+    return null;
+  }
+
+  return { x, y };
+}
+
+function solveAffineAxis(
+  samples: CalibrationSample[],
+  getTarget: (sample: CalibrationSample) => number,
+): AffineCoefficients | null {
+  const matrix = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  const vector = [0, 0, 0];
+
+  for (const sample of samples) {
+    const input = [sample.raw.x, sample.raw.y, 1];
+    const target = getTarget(sample);
+
+    for (let row = 0; row < 3; row += 1) {
+      vector[row] += input[row] * target;
+      for (let column = 0; column < 3; column += 1) {
+        matrix[row][column] += input[row] * input[column];
+      }
+    }
+  }
+
+  return solveThreeByThree(matrix, vector);
+}
+
+function applyAffine(raw: GazePoint, coefficients: AffineCoefficients): number {
+  return coefficients[0] * raw.x + coefficients[1] * raw.y + coefficients[2];
+}
+
+function solveThreeByThree(
+  matrix: number[][],
+  vector: number[],
+): AffineCoefficients | null {
+  const augmented = matrix.map((row, index) => [...row, vector[index] ?? 0]);
+
+  for (let pivotIndex = 0; pivotIndex < 3; pivotIndex += 1) {
+    let bestRow = pivotIndex;
+    for (let row = pivotIndex + 1; row < 3; row += 1) {
+      if (
+        Math.abs(augmented[row]?.[pivotIndex] ?? 0) >
+        Math.abs(augmented[bestRow]?.[pivotIndex] ?? 0)
+      ) {
+        bestRow = row;
+      }
+    }
+
+    const pivot = augmented[bestRow]?.[pivotIndex] ?? 0;
+    if (Math.abs(pivot) <= 0.000001) {
+      return null;
+    }
+
+    if (bestRow !== pivotIndex) {
+      const nextPivotRow = augmented[pivotIndex];
+      augmented[pivotIndex] = augmented[bestRow] ?? [];
+      augmented[bestRow] = nextPivotRow ?? [];
+    }
+
+    for (let column = pivotIndex; column < 4; column += 1) {
+      augmented[pivotIndex][column] =
+        (augmented[pivotIndex][column] ?? 0) / pivot;
+    }
+
+    for (let row = 0; row < 3; row += 1) {
+      if (row === pivotIndex) {
+        continue;
+      }
+
+      const factor = augmented[row]?.[pivotIndex] ?? 0;
+      for (let column = pivotIndex; column < 4; column += 1) {
+        augmented[row][column] =
+          (augmented[row][column] ?? 0) -
+          factor * (augmented[pivotIndex][column] ?? 0);
+      }
+    }
+  }
+
+  return [
+    augmented[0]?.[3] ?? 0,
+    augmented[1]?.[3] ?? 0,
+    augmented[2]?.[3] ?? 0,
+  ];
 }

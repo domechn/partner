@@ -5,6 +5,7 @@ export type OllamaChatRole = "system" | "user" | "assistant";
 export type OllamaChatMessage = {
   role: OllamaChatRole;
   content: string;
+  images?: string[];
 };
 
 export type OllamaChatRequest = {
@@ -18,6 +19,7 @@ type OllamaGenerateRequest = {
   stream: true;
   prompt: string;
   system?: string;
+  images?: string[];
 };
 
 export type BuildOllamaChatRequestOptions = {
@@ -49,6 +51,7 @@ export function buildOllamaChatRequest(
   options: BuildOllamaChatRequestOptions,
 ): OllamaChatRequest {
   const messages: OllamaChatMessage[] = [];
+  const latestImageTurnId = findLatestUserImageTurnId(snapshot);
 
   if (options.systemPrompt?.trim()) {
     messages.push({
@@ -67,10 +70,21 @@ export function buildOllamaChatRequest(
       continue;
     }
 
-    messages.push({
+    const message: OllamaChatMessage = {
       role: turn.role,
       content: text,
-    });
+    };
+
+    const turnImages = collectTurnImages(turn);
+    if (
+      turn.role === "user" &&
+      turn.id === latestImageTurnId &&
+      turnImages.length > 0
+    ) {
+      message.images = turnImages;
+    }
+
+    messages.push(message);
   }
 
   return {
@@ -85,6 +99,8 @@ function buildOllamaGenerateRequest(
   options: BuildOllamaChatRequestOptions,
 ): OllamaGenerateRequest {
   const promptLines: string[] = [];
+  const images: string[] = [];
+  const latestImageTurnId = findLatestUserImageTurnId(snapshot);
 
   for (const turn of snapshot.turns) {
     if (turn.status === "interrupted") {
@@ -97,6 +113,14 @@ function buildOllamaGenerateRequest(
     }
 
     promptLines.push(`${turn.role}: ${text}`);
+    const turnImages = collectTurnImages(turn);
+    if (
+      turn.role === "user" &&
+      turn.id === latestImageTurnId &&
+      turnImages.length > 0
+    ) {
+      images.push(...turnImages);
+    }
   }
 
   const request: OllamaGenerateRequest = {
@@ -109,7 +133,36 @@ function buildOllamaGenerateRequest(
     request.system = options.systemPrompt.trim();
   }
 
+  if (images.length > 0) {
+    request.images = images;
+  }
+
   return request;
+}
+
+function findLatestUserImageTurnId(
+  snapshot: ConversationSnapshot,
+): string | null {
+  for (let index = snapshot.turns.length - 1; index >= 0; index -= 1) {
+    const turn = snapshot.turns[index];
+    if (
+      turn?.role === "user" &&
+      turn.status !== "interrupted" &&
+      collectTurnImages(turn).length > 0
+    ) {
+      return turn.id;
+    }
+  }
+
+  return null;
+}
+
+function collectTurnImages(
+  turn: ConversationSnapshot["turns"][number],
+): string[] {
+  return [turn.imageBase64, turn.screenImageBase64].filter(
+    (image): image is string => !!image,
+  );
 }
 
 export async function* streamOllamaChatReply(

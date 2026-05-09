@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { estimateGazeFromFaceLandmarks, type FaceLandmark } from "./gaze.ts";
+import {
+  estimateGazeFromFaceLandmarks,
+  mapWithCalibration,
+  type CalibrationSample,
+  type FaceLandmark,
+} from "./gaze.ts";
 
 function createLandmarks(): FaceLandmark[] {
   return Array.from({ length: 478 }, () => ({ x: 0.5, y: 0.5 }));
@@ -43,4 +48,22 @@ test("estimateGazeFromFaceLandmarks follows iris movement", () => {
   assert.ok(gaze);
   assert.ok(gaze.x > 0.65);
   assert.ok(gaze.y > 0.65);
+});
+
+test("mapWithCalibration learns inverted and offset gaze axes", () => {
+  const samples: CalibrationSample[] = [
+    { raw: { x: 0.82, y: 0.18 }, target: { x: 0.1, y: 0.1 } },
+    { raw: { x: 0.18, y: 0.18 }, target: { x: 0.9, y: 0.1 } },
+    { raw: { x: 0.5, y: 0.5 }, target: { x: 0.5, y: 0.5 } },
+    { raw: { x: 0.82, y: 0.82 }, target: { x: 0.1, y: 0.9 } },
+    { raw: { x: 0.18, y: 0.82 }, target: { x: 0.9, y: 0.9 } },
+  ];
+
+  const mappedLeftTop = mapWithCalibration({ x: 0.82, y: 0.18 }, samples);
+  const mappedRightBottom = mapWithCalibration({ x: 0.18, y: 0.82 }, samples);
+
+  assert.ok(mappedLeftTop.x < 0.15);
+  assert.ok(mappedLeftTop.y < 0.15);
+  assert.ok(mappedRightBottom.x > 0.85);
+  assert.ok(mappedRightBottom.y > 0.85);
 });

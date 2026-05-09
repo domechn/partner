@@ -1,7 +1,12 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 export type SplitTextForSpeechOptions = {
   softLimit?: number;
+  hardLimit?: number;
 };
 
 export type SplitTextForSpeechResult = {
@@ -25,8 +30,40 @@ export type LocalTtsPlayer = {
 
 type TtsLanguage = "zh" | "en" | "unknown";
 
+export const QWEN3_TTS_LIGHTWEIGHT_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base";
+
+export type HuggingFaceTtsRequest = {
+  model: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string;
+};
+
+export type BuildHuggingFaceTtsRequestOptions = {
+  model?: string;
+  endpoint?: string;
+  token?: string;
+};
+
+export type PlayAudioBuffer = (
+  audio: Uint8Array,
+  mimeType: string,
+  signal: AbortSignal,
+) => Promise<void>;
+
+export type HuggingFaceTtsSpeakerOptions = BuildHuggingFaceTtsRequestOptions & {
+  fetchImpl?: typeof fetch;
+  playAudioBuffer?: PlayAudioBuffer;
+  fallbackSpeaker?: SpeakText;
+  disableFallback?: boolean;
+};
+
 const STRONG_BREAKS = new Set(["。", "！", "？", "!", "?", ";", "；"]);
 const SOFT_BREAKS = new Set(["，", ",", "：", ":"]);
+export const STREAMING_TTS_SPLIT_OPTIONS = {
+  softLimit: 8,
+  hardLimit: 9,
+} as const satisfies SplitTextForSpeechOptions;
 const DEFAULT_VOICE_BY_LANGUAGE: Record<
   Exclude<TtsLanguage, "unknown">,
   string
@@ -40,6 +77,7 @@ export function splitTextForSpeech(
   options: SplitTextForSpeechOptions = {},
 ): SplitTextForSpeechResult {
   const softLimit = options.softLimit ?? 36;
+  const hardLimit = options.hardLimit ?? 48;
   const chunks: string[] = [];
   let buffer = "";
 
@@ -61,6 +99,15 @@ export function splitTextForSpeech(
         chunks.push(chunk);
       }
       buffer = "";
+      continue;
+    }
+
+    if (buffer.length >= hardLimit) {
+      const chunk = buffer.trim();
+      if (chunk) {
+        chunks.push(chunk);
+      }
+      buffer = "";
     }
   }
 
@@ -70,10 +117,18 @@ export function splitTextForSpeech(
   };
 }
 
+export function splitStreamingTextForSpeech(
+  text: string,
+): SplitTextForSpeechResult {
+  return splitTextForSpeech(text, STREAMING_TTS_SPLIT_OPTIONS);
+}
+
 export function createLocalTtsPlayer(
   options: LocalTtsPlayerOptions = {},
 ): LocalTtsPlayer {
-  const speakText = options.speakText ?? createSystemSaySpeaker();
+  const speakText =
+    options.speakText ??
+    createHuggingFaceTtsSpeaker({ fallbackSpeaker: createSystemSaySpeaker() });
 
   let queue: string[] = [];
   let activeController: AbortController | null = null;
@@ -136,6 +191,89 @@ export function createLocalTtsPlayer(
   };
 }
 
+export function buildHuggingFaceTtsRequest(
+  text: string,
+  options: BuildHuggingFaceTtsRequestOptions = {},
+): HuggingFaceTtsRequest {
+  const model =
+    options.model?.trim() ||
+    process.env.PARTNER_QWEN_TTS_MODEL?.trim() ||
+    QWEN3_TTS_LIGHTWEIGHT_MODEL;
+  const url =
+    options.endpoint?.trim() ||
+    process.env.PARTNER_QWEN_TTS_ENDPOINT?.trim() ||
+    `https://api-inference.huggingface.co/models/${model}`;
+  const token =
+    options.token?.trim() ||
+    process.env.PARTNER_HF_TOKEN?.trim() ||
+    process.env.HF_TOKEN?.trim();
+  const headers: Record<string, string> = {
+    accept: "audio/wav",
+    "content-type": "application/json",
+  };
+
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
+
+  return {
+    model,
+    url,
+    headers,
+    body: JSON.stringify({ inputs: text.trim() }),
+  };
+}
+
+export function createHuggingFaceTtsSpeaker(
+  options: HuggingFaceTtsSpeakerOptions = {},
+): SpeakText {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const playAudioBuffer = options.playAudioBuffer ?? playAudioWithAfplay;
+  const fallbackSpeaker = options.fallbackSpeaker;
+
+  return async (text, signal) => {
+    const normalized = text.trim();
+    if (!normalized) {
+      return;
+    }
+
+    try {
+      const request = buildHuggingFaceTtsRequest(normalized, options);
+      const response = await fetchImpl(request.url, {
+        method: "POST",
+        headers: request.headers,
+        body: request.body,
+        signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `Qwen3 TTS request failed (${response.status}): ${await response.text()}`,
+        );
+      }
+
+      const mimeType = response.headers.get("content-type") ?? "audio/wav";
+      if (/json/i.test(mimeType)) {
+        throw new Error(
+          `Qwen3 TTS returned non-audio response: ${await response.text()}`,
+        );
+      }
+
+      await playAudioBuffer(
+        new Uint8Array(await response.arrayBuffer()),
+        mimeType,
+        signal,
+      );
+    } catch (error) {
+      if (signal.aborted || options.disableFallback || !fallbackSpeaker) {
+        throw error;
+      }
+
+      await fallbackSpeaker(normalized, signal);
+    }
+  };
+}
+
 export function buildSystemSayArgs(
   text: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -185,6 +323,86 @@ function createSystemSaySpeaker(): SpeakText {
       return runSay(fallbackArgs, signal);
     });
   };
+}
+
+async function playAudioWithAfplay(
+  audio: Uint8Array,
+  mimeType: string,
+  signal: AbortSignal,
+): Promise<void> {
+  if (process.platform !== "darwin" || audio.length === 0) {
+    return;
+  }
+
+  const filePath = path.join(
+    tmpdir(),
+    `partner-qwen-tts-${randomUUID()}.${getAudioExtension(mimeType)}`,
+  );
+
+  await writeFile(filePath, audio);
+  try {
+    await runAudioPlayer("afplay", [filePath], signal);
+  } finally {
+    await rm(filePath, { force: true });
+  }
+}
+
+function runAudioPlayer(
+  command: string,
+  args: string[],
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args);
+    let settled = false;
+
+    const finish = (error?: Error): void => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    };
+
+    const onAbort = (): void => {
+      child.kill("SIGTERM");
+      finish();
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    child.on("error", (error) => finish(error));
+    child.on("exit", (code, exitSignal) => {
+      if (signal.aborted || exitSignal === "SIGTERM" || code === 0) {
+        finish();
+        return;
+      }
+
+      finish(new Error(`${command} exited with code ${String(code)}`));
+    });
+  });
+}
+
+function getAudioExtension(mimeType: string): string {
+  if (/mpeg|mp3/i.test(mimeType)) {
+    return "mp3";
+  }
+
+  if (/ogg/i.test(mimeType)) {
+    return "ogg";
+  }
+
+  if (/webm/i.test(mimeType)) {
+    return "webm";
+  }
+
+  return "wav";
 }
 
 function runSay(args: string[], signal: AbortSignal): Promise<void> {

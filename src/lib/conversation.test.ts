@@ -40,6 +40,46 @@ test("commits a user turn and moves into thinking", () => {
   assert.equal(next.turns[0]?.text, "帮我总结今天的会议");
 });
 
+test("commits a user turn with the latest camera image for vision models", () => {
+  const next = applyEvents([
+    { type: "session.started" },
+    {
+      type: "user.turn.committed",
+      text: "看看我现在指的这个是什么",
+      imageBase64: "camera-frame-base64",
+    },
+  ]);
+
+  assert.equal(next.turns[0]?.imageBase64, "camera-frame-base64");
+});
+
+test("commits a user turn with the latest screen image for vision models", () => {
+  const next = applyEvents([
+    { type: "session.started" },
+    {
+      type: "user.turn.committed",
+      text: "打开我正在看的这个软件",
+      screenImageBase64: "screen-frame-base64",
+    },
+  ]);
+
+  assert.equal(next.turns[0]?.screenImageBase64, "screen-frame-base64");
+});
+
+test("assistant failure fills the empty streaming turn with an error message", () => {
+  const next = applyEvents([
+    { type: "session.started" },
+    { type: "user.turn.committed", text: "继续" },
+    { type: "assistant.turn.started" },
+    { type: "assistant.turn.failed", message: "助手没有返回内容，请重试。" },
+  ]);
+
+  assert.equal(next.phase, "listening");
+  assert.equal(next.turns[1]?.role, "assistant");
+  assert.equal(next.turns[1]?.status, "interrupted");
+  assert.equal(next.turns[1]?.text, "助手没有返回内容，请重试。");
+});
+
 test("streams assistant deltas into a single speaking turn", () => {
   const next = applyEvents([
     { type: "session.started" },

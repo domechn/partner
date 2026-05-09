@@ -69,6 +69,7 @@ export async function startContinuousAudioSession(
   let stopped = false;
   let intervalId: number | null = null;
   let activeRecorder: MediaRecorder | null = null;
+  let recorderHeaderChunk: RecordedAudioChunk | null = null;
   let recordedChunks: RecordedAudioChunk[] = [];
   let activeSpeechStartMs: number | null = null;
   let pendingSegment: PendingSpeechSegment | null = null;
@@ -76,6 +77,7 @@ export async function startContinuousAudioSession(
 
   const cleanupRecorder = (): void => {
     activeRecorder = null;
+    recorderHeaderChunk = null;
     recordedChunks = [];
     activeSpeechStartMs = null;
     pendingSegment = null;
@@ -94,24 +96,23 @@ export async function startContinuousAudioSession(
       return;
     }
 
-    const receivedAtMs = performance.now();
-    recordedChunks.push({ blob, receivedAtMs });
+    const chunk = { blob, receivedAtMs: performance.now() };
+    recorderHeaderChunk ??= chunk;
+    recordedChunks.push(chunk);
 
     if (!pendingSegment && activeSpeechStartMs === null) {
       recordedChunks = trimRecordedAudioChunks(recordedChunks, {
-        nowMs: receivedAtMs,
+        nowMs: chunk.receivedAtMs,
         preSpeechMs,
       });
     }
   };
 
   const buildAudioBlob = (chunks: RecordedAudioChunk[]): Blob => {
-    return new Blob(
-      chunks.map((chunk) => chunk.blob),
-      {
-        type: activeRecorder?.mimeType || chunks[0]?.blob.type || "audio/webm",
-      },
-    );
+    return buildSpeechAudioBlob(chunks, {
+      headerChunk: recorderHeaderChunk,
+      mimeType: activeRecorder?.mimeType,
+    });
   };
 
   const deliverPendingSegment = (): void => {
@@ -267,6 +268,29 @@ export function trimRecordedAudioChunks(
 ): RecordedAudioChunk[] {
   const cutoffMs = options.nowMs - options.preSpeechMs;
   return chunks.filter((chunk) => chunk.receivedAtMs >= cutoffMs);
+}
+
+export function buildSpeechAudioBlob(
+  chunks: RecordedAudioChunk[],
+  options: {
+    headerChunk?: RecordedAudioChunk | null;
+    mimeType?: string;
+  } = {},
+): Blob {
+  const needsHeader =
+    !!options.headerChunk && !chunks.includes(options.headerChunk);
+  const blobParts = [
+    ...(needsHeader && options.headerChunk ? [options.headerChunk.blob] : []),
+    ...chunks.map((chunk) => chunk.blob),
+  ];
+
+  return new Blob(blobParts, {
+    type:
+      options.mimeType ||
+      options.headerChunk?.blob.type ||
+      chunks[0]?.blob.type ||
+      "audio/webm",
+  });
 }
 
 export function measureRmsLevel(frame: Float32Array): number {

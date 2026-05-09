@@ -17,6 +17,8 @@ export type ConversationTurn = {
   role: ConversationTurnRole;
   text: string;
   status: ConversationTurnStatus;
+  imageBase64?: string;
+  screenImageBase64?: string;
 };
 
 export type PendingConversationConfirmation = {
@@ -53,7 +55,12 @@ export type ConversationEvent =
   | { type: "user.speech.started" }
   | { type: "user.transcription.started" }
   | { type: "user.turn.discarded"; reason?: string }
-  | { type: "user.turn.committed"; text: string }
+  | {
+      type: "user.turn.committed";
+      text: string;
+      imageBase64?: string;
+      screenImageBase64?: string;
+    }
   | { type: "assistant.turn.started" }
   | { type: "assistant.turn.delta"; delta: string }
   | { type: "assistant.turn.completed" }
@@ -134,7 +141,16 @@ export function reduceConversationSnapshot(
         ...snapshot,
         isActive: true,
         phase: "thinking",
-        turns: [...snapshot.turns, createTurn("user", text, "complete")],
+        turns: [
+          ...removeEmptyStreamingAssistantTurn(snapshot.turns),
+          createTurn(
+            "user",
+            text,
+            "complete",
+            event.imageBase64,
+            event.screenImageBase64,
+          ),
+        ],
         lastError: null,
       };
     }
@@ -187,7 +203,7 @@ export function reduceConversationSnapshot(
     }
     case "assistant.turn.failed":
       return {
-        ...finalizeAssistantTurn(snapshot, "interrupted"),
+        ...finalizeAssistantTurn(snapshot, "interrupted", event.message),
         isActive: true,
         phase: "listening",
         lastError: event.message,
@@ -215,13 +231,40 @@ function createTurn(
   role: ConversationTurnRole,
   text: string,
   status: ConversationTurnStatus,
+  imageBase64?: string,
+  screenImageBase64?: string,
 ): ConversationTurn {
-  return {
+  const turn: ConversationTurn = {
     id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     role,
     text,
     status,
   };
+
+  if (imageBase64) {
+    turn.imageBase64 = imageBase64;
+  }
+
+  if (screenImageBase64) {
+    turn.screenImageBase64 = screenImageBase64;
+  }
+
+  return turn;
+}
+
+function removeEmptyStreamingAssistantTurn(
+  turns: ConversationTurn[],
+): ConversationTurn[] {
+  const lastTurn = turns[turns.length - 1];
+  if (
+    lastTurn?.role === "assistant" &&
+    lastTurn.status === "streaming" &&
+    !lastTurn.text.trim()
+  ) {
+    return turns.slice(0, -1);
+  }
+
+  return turns;
 }
 
 function ensureStreamingAssistantTurn(
@@ -238,6 +281,7 @@ function ensureStreamingAssistantTurn(
 function finalizeAssistantTurn(
   snapshot: ConversationSnapshot,
   status: Extract<ConversationTurnStatus, "complete" | "interrupted">,
+  fallbackText = "",
 ): ConversationSnapshot {
   const turns = ensureStreamingAssistantTurn(snapshot.turns);
   const lastTurn = turns[turns.length - 1];
@@ -256,6 +300,7 @@ function finalizeAssistantTurn(
       ...turns.slice(0, -1),
       {
         ...lastTurn,
+        text: lastTurn.text || fallbackText,
         status,
       },
     ],

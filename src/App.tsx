@@ -11,6 +11,7 @@ function App() {
     cameraReady,
     calibrated,
     calibrationStep,
+    captureConversationImage,
     currentCalibrationPoint,
     gaze,
     onCalibrationCapture,
@@ -31,7 +32,10 @@ function App() {
     stopConversation,
     submitConversationInput,
     transcript,
-  } = usePartnerConversation({ onStatusChange: setStatus });
+  } = usePartnerConversation({
+    captureImage: captureConversationImage,
+    onStatusChange: setStatus,
+  });
 
   return (
     <main className="app-root">

@@ -8,6 +8,7 @@ import {
 import { parseConversationControl } from "../lib/conversationControl";
 import { type AutomationResult } from "../lib/intent";
 import { transcribeAudioBlob } from "../lib/localSpeech";
+import { getSpeechStartDecision } from "./conversationSpeech.ts";
 import {
   canUseLocalSpeechRecognition,
   getLocalSpeechRecognitionErrorMessage,
@@ -19,6 +20,7 @@ import {
 import { getDefaultVadConfig } from "../lib/voice/vad";
 
 export type UsePartnerConversationOptions = {
+  captureImage?: () => string | undefined;
   onStatusChange: (status: string) => void;
 };
 
@@ -42,7 +44,7 @@ export type UsePartnerConversationResult = {
 export function usePartnerConversation(
   options: UsePartnerConversationOptions,
 ): UsePartnerConversationResult {
-  const { onStatusChange } = options;
+  const { captureImage, onStatusChange } = options;
   const conversationAudioSessionRef = useRef<ContinuousAudioSession | null>(
     null,
   );
@@ -146,8 +148,7 @@ export function usePartnerConversation(
 
       return result;
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "确认执行失败。";
+      const message = error instanceof Error ? error.message : "确认执行失败。";
       onStatusChange(message);
       return null;
     }
@@ -199,7 +200,10 @@ export function usePartnerConversation(
         throw new Error("当前环境不支持会话桥接，请使用桌面端。");
       }
 
-      const snapshot = await window.partner.submitConversationTurn(text);
+      const snapshot = await window.partner.submitConversationTurn(
+        text,
+        captureImage?.(),
+      );
       setConversationSnapshot(snapshot);
       setLastAutomationResult(null);
       onStatusChange(`已提交当前语音：${text}`);
@@ -209,6 +213,7 @@ export function usePartnerConversation(
       clearConversationConfirmation,
       confirmConversationAction,
       conversationSnapshot.pendingConfirmation,
+      captureImage,
       onStatusChange,
     ],
   );
@@ -244,15 +249,19 @@ export function usePartnerConversation(
               vadConfig: getDefaultVadConfig(),
               onSpeechStart: () => {
                 const phase = conversationPhaseRef.current;
-                const accepted = phase === "listening" || phase === "speaking";
-                conversationUtteranceAcceptedRef.current = accepted;
+                const decision = getSpeechStartDecision(phase);
+                conversationUtteranceAcceptedRef.current = decision.accepted;
 
-                if (phase === "speaking") {
+                if (decision.shouldInterruptAssistant) {
                   void window.partner?.interruptConversation("barge-in");
                 }
 
-                if (!accepted) {
-                  onStatusChange("当前上一轮仍在处理中，新的短句会被忽略。");
+                if (!decision.accepted) {
+                  onStatusChange(
+                    phase === "speaking"
+                      ? "助手正在播报，已忽略麦克风回声；需要打断时请点“打断播报”。"
+                      : "当前上一轮仍在处理中，新的短句会被忽略。",
+                  );
                   return;
                 }
 
@@ -264,12 +273,13 @@ export function usePartnerConversation(
                   !conversationUtteranceAcceptedRef.current ||
                   decision === "discard"
                 ) {
+                  if (!conversationUtteranceAcceptedRef.current) {
+                    return;
+                  }
+
                   void dispatchConversationEvent({
                     type: "user.turn.discarded",
-                    reason:
-                      decision === "discard"
-                        ? "检测到过短语音片段，已忽略。"
-                        : "当前上一轮仍在处理中，已忽略本次语音。",
+                    reason: "检测到过短语音片段，已忽略。",
                   });
                   return;
                 }
@@ -297,7 +307,8 @@ export function usePartnerConversation(
                     await handleConversationUtterance(text);
                   } catch (error) {
                     setIsTranscribing(false);
-                    const message = getLocalSpeechRecognitionErrorMessage(error);
+                    const message =
+                      getLocalSpeechRecognitionErrorMessage(error);
                     await dispatchConversationEvent({
                       type: "user.turn.discarded",
                       reason: message,
@@ -392,7 +403,12 @@ export function usePartnerConversation(
     } catch (error) {
       onStatusChange(error instanceof Error ? error.message : "提交对话失败。");
     }
-  }, [conversationInput, conversationSnapshot.isActive, handleConversationUtterance, onStatusChange]);
+  }, [
+    conversationInput,
+    conversationSnapshot.isActive,
+    handleConversationUtterance,
+    onStatusChange,
+  ]);
 
   return {
     canStreamConversation,

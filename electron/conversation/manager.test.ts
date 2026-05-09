@@ -52,6 +52,25 @@ test("interruptConversation marks an active assistant turn as interrupted", () =
   assert.ok(updateTypes.includes("assistant.turn.interrupted"));
 });
 
+test("submitting a new user turn removes an empty stale assistant stream", () => {
+  const manager = createConversationManager();
+
+  manager.startSession();
+  manager.submitUserTurn("第一句");
+  manager.dispatch({ type: "assistant.turn.started" });
+
+  const snapshot = manager.submitUserTurn("第二句");
+
+  assert.deepEqual(
+    snapshot.turns.map((turn) => [turn.role, turn.text, turn.status]),
+    [
+      ["user", "第一句", "complete"],
+      ["user", "第二句", "complete"],
+    ],
+  );
+  assert.equal(snapshot.phase, "thinking");
+});
+
 test("streams assistant reply deltas through the manager", async () => {
   const manager = createConversationManager({
     createReplyStream: async function* () {
@@ -172,4 +191,21 @@ test("keeps the assistant reply complete when automation proposal generation fai
   assert.equal(finalSnapshot.turns.length, 2);
   assert.equal(finalSnapshot.turns[1]?.status, "complete");
   assert.equal(finalSnapshot.pendingConfirmation, null);
+});
+
+test("turns an empty assistant stream into a visible failed reply", async () => {
+  const manager = createConversationManager({
+    createReplyStream: async function* () {
+      yield* [];
+    },
+  });
+
+  manager.startSession();
+  manager.submitUserTurn("继续");
+
+  const finalSnapshot = await manager.streamAssistantReply();
+
+  assert.equal(finalSnapshot.phase, "listening");
+  assert.equal(finalSnapshot.lastError, "助手没有返回内容，请重试。");
+  assert.equal(finalSnapshot.turns[1]?.text, "助手没有返回内容，请重试。");
 });

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildSpeechAudioBlob,
   measureRmsLevel,
   selectAudioChunksForSpeech,
   trimRecordedAudioChunks,
@@ -48,4 +49,34 @@ test("trimRecordedAudioChunks keeps only the rolling pre-speech buffer", () => {
     ),
     [650, 900],
   );
+});
+
+test("buildSpeechAudioBlob prepends the recorder header when chunks were trimmed", async () => {
+  const headerChunk: RecordedAudioChunk = {
+    blob: new Blob(["header"], { type: "audio/webm" }),
+    receivedAtMs: 100,
+  };
+  const speechChunk: RecordedAudioChunk = {
+    blob: new Blob(["speech"], { type: "audio/webm" }),
+    receivedAtMs: 1200,
+  };
+
+  const blob = buildSpeechAudioBlob([speechChunk], {
+    headerChunk,
+    mimeType: "audio/webm;codecs=opus",
+  });
+
+  assert.equal(blob.type, "audio/webm;codecs=opus");
+  assert.equal(await blob.text(), "headerspeech");
+});
+
+test("buildSpeechAudioBlob does not duplicate the header chunk", async () => {
+  const headerChunk: RecordedAudioChunk = {
+    blob: new Blob(["header"], { type: "audio/webm" }),
+    receivedAtMs: 100,
+  };
+
+  const blob = buildSpeechAudioBlob([headerChunk], { headerChunk });
+
+  assert.equal(await blob.text(), "header");
 });

@@ -26,8 +26,11 @@ const api = {
   stopConversation(reason?: string): Promise<ConversationSnapshot> {
     return ipcRenderer.invoke("conversation:stop", reason);
   },
-  submitConversationTurn(text: string): Promise<ConversationSnapshot> {
-    return ipcRenderer.invoke("conversation:submit-turn", text);
+  submitConversationTurn(
+    text: string,
+    imageBase64?: string,
+  ): Promise<ConversationSnapshot> {
+    return ipcRenderer.invoke("conversation:submit-turn", text, imageBase64);
   },
   interruptConversation(reason?: string): Promise<ConversationSnapshot> {
     return ipcRenderer.invoke("conversation:interrupt", reason);

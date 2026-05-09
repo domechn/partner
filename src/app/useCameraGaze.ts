@@ -26,6 +26,13 @@ type FaceDetectorLike = {
 
 type FaceDetectorCtor = new () => FaceDetectorLike;
 
+type GazeTrackingSource = "eye" | "face" | "mouse";
+
+type TimedGazeSample = {
+  point: GazePoint;
+  receivedAtMs: number;
+};
+
 type FaceLandmarkerResult = {
   faceLandmarks?: FaceLandmark[][];
 };
@@ -60,6 +67,10 @@ const MEDIAPIPE_VERSION = "0.10.35";
 const MEDIAPIPE_WASM_BASE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/wasm`;
 const FACE_LANDMARKER_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task";
+const CAMERA_GAZE_STALE_MS = 1200;
+const CALIBRATION_SAMPLE_WINDOW_MS = 700;
+const MAX_RECENT_EYE_GAZE_SAMPLES = 16;
+const GAZE_SMOOTHING = 0.35;
 
 export type UseCameraGazeOptions = {
   onStatusChange: (status: string) => void;
@@ -69,6 +80,7 @@ export type UseCameraGazeResult = {
   cameraReady: boolean;
   calibrated: boolean;
   calibrationStep: number;
+  captureConversationImage: () => string | undefined;
   currentCalibrationPoint: GazePoint;
   gaze: GazePoint;
   onCalibrationCapture: () => void;
@@ -82,6 +94,9 @@ export function useCameraGaze(
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const trackingStatusRef = useRef("");
+  const lastCameraGazeAtRef = useRef(0);
+  const recentEyeGazeSamplesRef = useRef<TimedGazeSample[]>([]);
+  const smoothedGazeRef = useRef<GazePoint>({ x: 0.5, y: 0.5 });
 
   const [cameraReady, setCameraReady] = useState(false);
   const [rawGaze, setRawGaze] = useState<GazePoint>({ x: 0.5, y: 0.5 });
@@ -94,6 +109,36 @@ export function useCameraGaze(
   const gaze = useMemo(
     () => mapWithCalibration(rawGaze, calibrationSamples),
     [rawGaze, calibrationSamples],
+  );
+
+  const updateRawGaze = useCallback(
+    (point: GazePoint, source: GazeTrackingSource) => {
+      const nowMs = performance.now();
+      const nextPoint = { x: clamp(point.x), y: clamp(point.y) };
+      const smoothedPoint =
+        source === "mouse"
+          ? nextPoint
+          : smoothGaze(smoothedGazeRef.current, nextPoint);
+
+      smoothedGazeRef.current = smoothedPoint;
+
+      if (source === "eye" || source === "face") {
+        lastCameraGazeAtRef.current = nowMs;
+      }
+
+      if (source === "eye") {
+        recentEyeGazeSamplesRef.current = [
+          ...recentEyeGazeSamplesRef.current.filter(
+            (sample) =>
+              nowMs - sample.receivedAtMs <= CALIBRATION_SAMPLE_WINDOW_MS * 2,
+          ),
+          { point: smoothedPoint, receivedAtMs: nowMs },
+        ].slice(-MAX_RECENT_EYE_GAZE_SAMPLES);
+      }
+
+      setRawGaze(smoothedPoint);
+    },
+    [],
   );
 
   const reportTrackingStatus = useCallback(
@@ -187,7 +232,8 @@ export function useCameraGaze(
 
       try {
         const video = videoRef.current;
-        let nextGaze: GazePoint | null = null;
+        let nextGaze: { point: GazePoint; source: GazeTrackingSource } | null =
+          null;
 
         if (
           faceLandmarker &&
@@ -197,9 +243,12 @@ export function useCameraGaze(
             video,
             performance.now(),
           );
-          nextGaze = estimateGazeFromFaceLandmarks(
+          const eyeGaze = estimateGazeFromFaceLandmarks(
             result.faceLandmarks?.[0] ?? [],
           );
+          if (eyeGaze) {
+            nextGaze = { point: eyeGaze, source: "eye" };
+          }
         }
 
         if (!nextGaze && detector) {
@@ -212,12 +261,15 @@ export function useCameraGaze(
             const centerY =
               (first.boundingBox.y + first.boundingBox.height / 2) /
               video.videoHeight;
-            nextGaze = { x: clamp(centerX), y: clamp(centerY) };
+            nextGaze = {
+              point: { x: clamp(centerX), y: clamp(centerY) },
+              source: "face",
+            };
           }
         }
 
         if (nextGaze) {
-          setRawGaze(nextGaze);
+          updateRawGaze(nextGaze.point, nextGaze.source);
         }
       } catch {
         // Ignore detector errors; mouse fallback remains available.
@@ -237,7 +289,7 @@ export function useCameraGaze(
       }
       faceLandmarker?.close?.();
     };
-  }, [cameraReady, reportTrackingStatus]);
+  }, [cameraReady, reportTrackingStatus, updateRawGaze]);
 
   useEffect(() => {
     if (!window.partner) {
@@ -266,13 +318,60 @@ export function useCameraGaze(
 
       const x = (event.clientX - rect.left) / rect.width;
       const y = (event.clientY - rect.top) / rect.height;
-      setRawGaze({ x: clamp(x), y: clamp(y) });
+
+      if (
+        performance.now() - lastCameraGazeAtRef.current <=
+        CAMERA_GAZE_STALE_MS
+      ) {
+        return;
+      }
+
+      updateRawGaze({ x: clamp(x), y: clamp(y) }, "mouse");
     };
 
     window.addEventListener("mousemove", onMove);
     return () => {
       window.removeEventListener("mousemove", onMove);
     };
+  }, [updateRawGaze]);
+
+  const getRecentEyeGazeAverage = useCallback((): GazePoint | null => {
+    const nowMs = performance.now();
+    const recentSamples = recentEyeGazeSamplesRef.current.filter(
+      (sample) => nowMs - sample.receivedAtMs <= CALIBRATION_SAMPLE_WINDOW_MS,
+    );
+    recentEyeGazeSamplesRef.current = recentSamples;
+
+    if (recentSamples.length === 0) {
+      return null;
+    }
+
+    return averageGaze(recentSamples.map((sample) => sample.point));
+  }, []);
+
+  const captureConversationImage = useCallback((): string | undefined => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      return undefined;
+    }
+
+    const maxWidth = 640;
+    const scale = Math.min(1, maxWidth / video.videoWidth);
+    const width = Math.max(1, Math.round(video.videoWidth * scale));
+    const height = Math.max(1, Math.round(video.videoHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return undefined;
+    }
+
+    context.drawImage(video, 0, 0, width, height);
+    return canvas
+      .toDataURL("image/jpeg", 0.72)
+      .replace(/^data:image\/jpeg;base64,/, "");
   }, []);
 
   const onCalibrationCapture = useCallback(() => {
@@ -280,20 +379,36 @@ export function useCameraGaze(
       return;
     }
 
+    const calibrationRawGaze = getRecentEyeGazeAverage();
+    if (!calibrationRawGaze) {
+      onStatusChange(
+        "还没有稳定的眼部追踪样本，校准不会记录鼠标位置。请看向摄像头，等水泡开始跟随眼睛后再点校准。",
+      );
+      return;
+    }
+
+    const nextStep = calibrationStep + 1;
+
     setCalibrationSamples((previous) => [
       ...previous,
       {
-        raw: rawGaze,
+        raw: calibrationRawGaze,
         target: CALIBRATION_POINTS[calibrationStep],
       },
     ]);
-    setCalibrationStep((step) => step + 1);
-  }, [calibrationStep, rawGaze]);
+    setCalibrationStep(nextStep);
+    onStatusChange(
+      nextStep >= CALIBRATION_POINTS.length
+        ? "校准完成，桌面水泡会使用你的眼动样本重新映射屏幕位置。"
+        : `已记录第 ${nextStep} 个校准点，请继续看向下一个点。`,
+    );
+  }, [calibrationStep, getRecentEyeGazeAverage, onStatusChange]);
 
   return {
     cameraReady,
     calibrated,
     calibrationStep,
+    captureConversationImage,
     currentCalibrationPoint: getCurrentCalibrationPoint(calibrationStep),
     gaze,
     onCalibrationCapture,
@@ -314,4 +429,18 @@ async function createMediaPipeFaceLandmarker(): Promise<FaceLandmarkerLike> {
     numFaces: 1,
     runningMode: "VIDEO",
   });
+}
+
+function smoothGaze(previous: GazePoint, next: GazePoint): GazePoint {
+  return {
+    x: clamp(previous.x + (next.x - previous.x) * GAZE_SMOOTHING),
+    y: clamp(previous.y + (next.y - previous.y) * GAZE_SMOOTHING),
+  };
+}
+
+function averageGaze(points: GazePoint[]): GazePoint {
+  return {
+    x: clamp(points.reduce((sum, point) => sum + point.x, 0) / points.length),
+    y: clamp(points.reduce((sum, point) => sum + point.y, 0) / points.length),
+  };
 }

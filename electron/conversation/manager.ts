@@ -38,7 +38,11 @@ export type ConversationManager = {
   dispatch: (event: ConversationEvent) => ConversationSnapshot;
   startSession: () => ConversationSnapshot;
   stopSession: (reason?: string) => ConversationSnapshot;
-  submitUserTurn: (text: string) => ConversationSnapshot;
+  submitUserTurn: (
+    text: string,
+    imageBase64?: string,
+    screenImageBase64?: string,
+  ) => ConversationSnapshot;
   interruptConversation: (reason?: string) => ConversationSnapshot;
   clearConfirmation: () => ConversationSnapshot;
   streamAssistantReply: () => Promise<ConversationSnapshot>;
@@ -80,8 +84,33 @@ export function createConversationManager(
       activeReplyController = null;
       return dispatch({ type: "session.stopped", reason });
     },
-    submitUserTurn(text: string) {
-      return dispatch({ type: "user.turn.committed", text });
+    submitUserTurn(
+      text: string,
+      imageBase64?: string,
+      screenImageBase64?: string,
+    ) {
+      activeReplyController?.abort("new-user-turn");
+      activeReplyController = null;
+
+      const lastTurn = snapshot.turns[snapshot.turns.length - 1];
+      if (
+        snapshot.phase === "speaking" &&
+        lastTurn?.role === "assistant" &&
+        lastTurn.status === "streaming" &&
+        lastTurn.text.trim()
+      ) {
+        dispatch({
+          type: "assistant.turn.interrupted",
+          reason: "new-user-turn",
+        });
+      }
+
+      return dispatch({
+        type: "user.turn.committed",
+        text,
+        imageBase64,
+        screenImageBase64,
+      });
     },
     interruptConversation(reason = "manual") {
       activeReplyController?.abort(reason);
@@ -126,6 +155,13 @@ export function createConversationManager(
 
         if (replyController.signal.aborted) {
           return snapshot;
+        }
+
+        if (!findLastAssistantTurn(snapshot)?.text.trim()) {
+          return dispatch({
+            type: "assistant.turn.failed",
+            message: "助手没有返回内容，请重试。",
+          });
         }
 
         const completedSnapshot = dispatch({

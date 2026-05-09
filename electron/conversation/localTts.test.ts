@@ -2,8 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  QWEN3_TTS_LIGHTWEIGHT_MODEL,
+  buildHuggingFaceTtsRequest,
+  createHuggingFaceTtsSpeaker,
   buildSystemSayArgs,
   createLocalTtsPlayer,
+  splitStreamingTextForSpeech,
   splitTextForSpeech,
 } from "./localTts.ts";
 
@@ -23,6 +27,67 @@ test("splitTextForSpeech flushes finished sentences and keeps the unfinished tai
 
   assert.deepEqual(result.chunks, ["你好。", "今天过得怎么样？"]);
   assert.equal(result.remainder, "我还在听");
+});
+
+test("splitTextForSpeech flushes long streaming token fragments before final punctuation", () => {
+  const result = splitTextForSpeech("这是模型正在实时返回的一段较长内容", {
+    hardLimit: 9,
+  });
+
+  assert.deepEqual(result.chunks, ["这是模型正在实时返"]);
+  assert.equal(result.remainder, "回的一段较长内容");
+});
+
+test("splitStreamingTextForSpeech starts speaking before a long reply finishes", () => {
+  const result = splitStreamingTextForSpeech("我看到画面里有一个窗口和");
+
+  assert.deepEqual(result.chunks, ["我看到画面里有一个"]);
+  assert.equal(result.remainder, "窗口和");
+});
+
+test("buildHuggingFaceTtsRequest targets the smallest Qwen3 TTS model by default", () => {
+  const request = buildHuggingFaceTtsRequest("你好，我在。", {
+    token: "hf_test",
+  });
+
+  assert.equal(QWEN3_TTS_LIGHTWEIGHT_MODEL, "Qwen/Qwen3-TTS-12Hz-0.6B-Base");
+  assert.equal(
+    request.url,
+    "https://api-inference.huggingface.co/models/Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+  );
+  assert.equal(request.headers.authorization, "Bearer hf_test");
+  assert.deepEqual(JSON.parse(request.body), { inputs: "你好，我在。" });
+});
+
+test("Hugging Face TTS speaker sends text to Qwen3 TTS and plays returned audio", async () => {
+  const played: Array<{ audio: Uint8Array; mimeType: string }> = [];
+  const fetchCalls: Array<{ url: string; body?: string }> = [];
+  const speaker = createHuggingFaceTtsSpeaker({
+    token: "hf_test",
+    fetchImpl: async (input, init) => {
+      fetchCalls.push({
+        url: String(input),
+        body: typeof init?.body === "string" ? init.body : undefined,
+      });
+
+      return new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "audio/wav" },
+      });
+    },
+    playAudioBuffer: async (audio, mimeType) => {
+      played.push({ audio, mimeType });
+    },
+  });
+
+  await speaker("你好", new AbortController().signal);
+
+  assert.equal(fetchCalls.length, 1);
+  assert.match(fetchCalls[0]?.url ?? "", /Qwen3-TTS-12Hz-0\.6B-Base$/);
+  assert.deepEqual(JSON.parse(fetchCalls[0]?.body ?? "{}"), { inputs: "你好" });
+  assert.deepEqual(played, [
+    { audio: new Uint8Array([1, 2, 3]), mimeType: "audio/wav" },
+  ]);
 });
 
 test("buildSystemSayArgs chooses a Chinese or English voice from the text", () => {

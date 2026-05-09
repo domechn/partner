@@ -62,6 +62,93 @@ test("builds an Ollama chat request from conversation turns", () => {
   assert.equal(request.stream, true);
 });
 
+test("builds multimodal Ollama chat messages with user camera images", () => {
+  const snapshot = createConversationSnapshot();
+  snapshot.turns.push({
+    id: "user-1",
+    role: "user",
+    text: "这张画面里有什么",
+    status: "complete",
+    imageBase64: "base64-frame",
+  });
+
+  const request = buildOllamaChatRequest(snapshot, {
+    model: "qwen3-vl:4b",
+  });
+
+  assert.deepEqual(request.messages, [
+    {
+      role: "user",
+      content: "这张画面里有什么",
+      images: ["base64-frame"],
+    },
+  ]);
+});
+
+test("builds multimodal Ollama chat messages with camera and screen images", () => {
+  const snapshot = createConversationSnapshot();
+  snapshot.turns.push({
+    id: "user-1",
+    role: "user",
+    text: "打开我正在看的这个软件",
+    status: "complete",
+    imageBase64: "camera-frame",
+    screenImageBase64: "screen-frame",
+  });
+
+  const request = buildOllamaChatRequest(snapshot, {
+    model: "qwen3-vl:4b",
+  });
+
+  assert.deepEqual(request.messages, [
+    {
+      role: "user",
+      content: "打开我正在看的这个软件",
+      images: ["camera-frame", "screen-frame"],
+    },
+  ]);
+});
+
+test("only includes the latest user camera image in multimodal chat history", () => {
+  const snapshot = createConversationSnapshot();
+  snapshot.turns.push(
+    {
+      id: "user-1",
+      role: "user",
+      text: "第一张画面里有什么",
+      status: "complete",
+      imageBase64: "old-frame",
+    },
+    {
+      id: "assistant-1",
+      role: "assistant",
+      text: "我看到了桌面。",
+      status: "complete",
+    },
+    {
+      id: "user-2",
+      role: "user",
+      text: "现在画面里有什么",
+      status: "complete",
+      imageBase64: "latest-frame",
+    },
+  );
+
+  const request = buildOllamaChatRequest(snapshot, {
+    model: "qwen3-vl:4b",
+  });
+
+  assert.deepEqual(request.messages, [
+    { role: "user", content: "第一张画面里有什么" },
+    { role: "assistant", content: "我看到了桌面。" },
+    {
+      role: "user",
+      content: "现在画面里有什么",
+      images: ["latest-frame"],
+    },
+  ]);
+});
+
 test("streams text deltas from an Ollama NDJSON response", async () => {
   const snapshot = createConversationSnapshot();
   snapshot.turns.push({

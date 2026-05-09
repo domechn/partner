@@ -19,7 +19,10 @@ declare global {
       getConversationSnapshot: () => Promise<ConversationSnapshot>;
       startConversation: () => Promise<ConversationSnapshot>;
       stopConversation: (reason?: string) => Promise<ConversationSnapshot>;
-      submitConversationTurn: (text: string) => Promise<ConversationSnapshot>;
+      submitConversationTurn: (
+        text: string,
+        imageBase64?: string,
+      ) => Promise<ConversationSnapshot>;
       interruptConversation: (reason?: string) => Promise<ConversationSnapshot>;
       confirmConversationAction: () => Promise<AutomationResult>;
       clearConversationConfirmation: () => Promise<ConversationSnapshot>;

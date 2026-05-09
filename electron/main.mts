@@ -1,4 +1,11 @@
-import { app, BrowserWindow, ipcMain, shell, screen } from "electron";
+import {
+  app,
+  BrowserWindow,
+  desktopCapturer,
+  ipcMain,
+  shell,
+  screen,
+} from "electron";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -6,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { createConversationManager } from "./conversation/manager.js";
 import {
   createLocalTtsPlayer,
-  splitTextForSpeech,
+  splitStreamingTextForSpeech,
 } from "./conversation/localTts.js";
 import { resolveOllamaAutomationRequest } from "./conversation/automationProposal.js";
 import { buildConversationSystemPrompt } from "./conversation/gazeContext.js";
@@ -15,6 +22,7 @@ import {
   buildGazeOverlayHtml,
   resolveGazeOverlayPoint,
 } from "./gazeOverlay.js";
+import { captureScreenImageBase64 } from "./screenCapture.js";
 import type {
   ConversationUpdate,
   RendererConversationEvent,
@@ -38,13 +46,14 @@ let ttsRemainder = "";
 
 const conversationConfig = {
   baseUrl: process.env.PARTNER_OLLAMA_BASE_URL || "http://127.0.0.1:11434",
-  model: process.env.PARTNER_OLLAMA_MODEL || "qwen2.5:7b",
+  model: process.env.PARTNER_OLLAMA_MODEL || "qwen3-vl:4b",
   allowInstalledModelFallback: !process.env.PARTNER_OLLAMA_MODEL,
   systemPrompt:
     process.env.PARTNER_SYSTEM_PROMPT ||
     [
       "你是 Partner 的本地语音助手。",
       "默认使用简洁中文回答。",
+      "你会收到用户最近的摄像头画面和电脑屏幕截图；当用户询问画面、屏幕、软件、这里、这个或我指的内容时，请结合图像和注视点回答。",
       "当前版本先专注于实时对话；涉及电脑操作时先解释意图，不要假装已经执行。",
       "如果上下文不足，就先追问一个最小澄清问题。",
     ].join(""),
@@ -212,11 +221,19 @@ ipcMain.handle("conversation:stop", (_event, reason?: string) => {
   return conversationManager.stopSession(reason);
 });
 
-ipcMain.handle("conversation:submit-turn", (_event, text: string) => {
-  const snapshot = conversationManager.submitUserTurn(text);
-  void conversationManager.streamAssistantReply();
-  return snapshot;
-});
+ipcMain.handle(
+  "conversation:submit-turn",
+  async (_event, text: string, imageBase64?: string) => {
+    const screenImageBase64 = await captureLatestScreenImageBase64();
+    const snapshot = conversationManager.submitUserTurn(
+      text,
+      imageBase64,
+      screenImageBase64,
+    );
+    void conversationManager.streamAssistantReply();
+    return snapshot;
+  },
+);
 
 ipcMain.handle("conversation:interrupt", (_event, reason?: string) => {
   ttsRemainder = "";
@@ -667,7 +684,9 @@ function buildConversationConfirmation(request: AutomationRequest | null) {
 function handleConversationTts(update: ConversationUpdate): void {
   switch (update.event.type) {
     case "assistant.turn.delta": {
-      const next = splitTextForSpeech(`${ttsRemainder}${update.event.delta}`);
+      const next = splitStreamingTextForSpeech(
+        `${ttsRemainder}${update.event.delta}`,
+      );
       ttsRemainder = next.remainder;
       for (const chunk of next.chunks) {
         ttsPlayer.enqueue(chunk);
@@ -721,6 +740,18 @@ function closeGazeOverlayWindow(): void {
 
   if (overlayWindow && !overlayWindow.isDestroyed()) {
     overlayWindow.close();
+  }
+}
+
+async function captureLatestScreenImageBase64(): Promise<string | undefined> {
+  try {
+    return await captureScreenImageBase64({
+      primaryDisplayId: screen.getPrimaryDisplay().id,
+      getSources: (options) => desktopCapturer.getSources(options),
+    });
+  } catch (error) {
+    console.warn("Partner screen capture failed:", error);
+    return undefined;
   }
 }
 
