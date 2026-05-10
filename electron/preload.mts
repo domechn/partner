@@ -50,13 +50,18 @@ const api = {
     transcript: string,
     response: string,
     imageBase64?: string,
+    screenImageBase64?: string,
   ): Promise<ConversationSnapshot> {
     return ipcRenderer.invoke(
       "conversation:partner-response",
       transcript,
       response,
       imageBase64,
+      screenImageBase64,
     );
+  },
+  captureScreenImage(): Promise<string | undefined> {
+    return ipcRenderer.invoke("partner:capture-screen-image");
   },
   partnerTtsCompleted(): Promise<ConversationSnapshot> {
     return ipcRenderer.invoke("partner:tts-completed");

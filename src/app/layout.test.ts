@@ -25,7 +25,7 @@ test("uses the shared button style across app controls", () => {
   const cameraPanel = readWorkspaceFile("src/app/CameraPanel.tsx");
   const conversationPanel = readWorkspaceFile("src/app/ConversationPanel.tsx");
 
-  assert.equal((app.match(/className="button /g) ?? []).length, 3);
+  assert.equal((app.match(/className="button /g) ?? []).length, 2);
   assert.match(cameraPanel, /className="button calibration-target"/);
   assert.equal(
     (conversationPanel.match(/className="button /g) ?? []).length,

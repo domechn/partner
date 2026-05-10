@@ -23,7 +23,6 @@ function App() {
     confirmConversationAction,
     conversationInput,
     conversationSnapshot,
-    interruptConversation,
     isStartingConversation,
     isTranscribing,
     lastAutomationResult,
@@ -34,6 +33,7 @@ function App() {
     transcript,
   } = usePartnerConversation({
     captureImage: captureConversationImage,
+    gaze,
     onStatusChange: setStatus,
   });
 
@@ -67,14 +67,6 @@ function App() {
             disabled={!conversationSnapshot.isActive}
           >
             停止对话
-          </button>
-          <button
-            type="button"
-            className="button button-secondary"
-            onClick={() => void interruptConversation()}
-            disabled={conversationSnapshot.phase !== "speaking"}
-          >
-            打断播报
           </button>
         </div>
       </header>

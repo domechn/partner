@@ -21,7 +21,7 @@ export type StartContinuousAudioOptions = {
     decision: "commit" | "discard";
   }) => void | Promise<void>;
   onError?: (error: unknown) => void;
-  vadConfig?: VadConfig;
+  vadConfig?: VadConfig | (() => VadConfig);
   analysisIntervalMs?: number;
   preSpeechMs?: number;
   recorderTimesliceMs?: number;
@@ -59,7 +59,13 @@ export async function startContinuousAudioSession(
   source.connect(analyser);
 
   const levels = new Float32Array(analyser.fftSize);
-  const vadConfig = options.vadConfig ?? getDefaultVadConfig();
+  const resolveVadConfig = (): VadConfig => {
+    if (typeof options.vadConfig === "function") {
+      return options.vadConfig();
+    }
+
+    return options.vadConfig ?? getDefaultVadConfig();
+  };
   const intervalMs = options.analysisIntervalMs ?? DEFAULT_ANALYSIS_INTERVAL_MS;
   const preSpeechMs = options.preSpeechMs ?? DEFAULT_PRE_SPEECH_MS;
   const recorderTimesliceMs =
@@ -208,7 +214,11 @@ export async function startContinuousAudioSession(
     }
 
     analyser.getFloatTimeDomainData(levels);
-    const step = consumeVadLevel(vadState, measureRmsLevel(levels), vadConfig);
+    const step = consumeVadLevel(
+      vadState,
+      measureRmsLevel(levels),
+      resolveVadConfig(),
+    );
     vadState = step.state;
 
     if (step.event.type === "speech-started") {

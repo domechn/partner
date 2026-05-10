@@ -296,6 +296,10 @@ ipcMain.handle("partner:get-server-port", () => {
   return startPartnerServer();
 });
 
+ipcMain.handle("partner:capture-screen-image", () => {
+  return captureLatestScreenImageBase64();
+});
+
 ipcMain.handle(
   "conversation:partner-response",
   async (
@@ -303,6 +307,7 @@ ipcMain.handle(
     transcript: string,
     response: string,
     imageBase64?: string,
+    screenImageBase64?: string,
   ) => {
     const userText = transcript.trim() || "（语音输入）";
     const assistantText = response.trim();
@@ -314,7 +319,11 @@ ipcMain.handle(
       });
     }
 
-    conversationManager.submitUserTurn(userText, imageBase64);
+    conversationManager.submitUserTurn(
+      userText,
+      imageBase64,
+      screenImageBase64,
+    );
     conversationManager.dispatch({ type: "assistant.turn.started" });
     conversationManager.dispatch({
       type: "assistant.turn.delta",

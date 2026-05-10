@@ -6,8 +6,12 @@ import {
   type RendererConversationEvent,
 } from "../lib/conversation";
 import { parseConversationControl } from "../lib/conversationControl";
-import { type AutomationResult } from "../lib/intent";
-import { getSpeechStartDecision } from "./conversationSpeech.ts";
+import { type AutomationResult, type GazePoint } from "../lib/intent";
+import {
+  getConversationVadConfig,
+  getSpeechStartDecision,
+} from "./conversationSpeech.ts";
+import type { PartnerVisualContext } from "./usePartnerAI.ts";
 import {
   canUseLocalSpeechRecognition,
   getLocalSpeechRecognitionErrorMessage,
@@ -16,11 +20,11 @@ import {
   startContinuousAudioSession,
   type ContinuousAudioSession,
 } from "../lib/voice/continuousAudio";
-import { getDefaultVadConfig } from "../lib/voice/vad";
 import { usePartnerAI } from "./usePartnerAI.ts";
 
 export type UsePartnerConversationOptions = {
   captureImage?: () => string | undefined;
+  gaze?: GazePoint;
   onStatusChange: (status: string) => void;
 };
 
@@ -30,7 +34,6 @@ export type UsePartnerConversationResult = {
   confirmConversationAction: () => Promise<AutomationResult | null>;
   conversationInput: string;
   conversationSnapshot: ConversationSnapshot;
-  interruptConversation: () => Promise<void>;
   isStartingConversation: boolean;
   isTranscribing: boolean;
   lastAutomationResult: AutomationResult | null;
@@ -44,12 +47,13 @@ export type UsePartnerConversationResult = {
 export function usePartnerConversation(
   options: UsePartnerConversationOptions,
 ): UsePartnerConversationResult {
-  const { captureImage, onStatusChange } = options;
+  const { captureImage, gaze, onStatusChange } = options;
   const conversationAudioSessionRef = useRef<ContinuousAudioSession | null>(
     null,
   );
   const conversationPhaseRef = useRef<ConversationSnapshot["phase"]>("idle");
   const conversationUtteranceAcceptedRef = useRef(true);
+  const speechStartCameraImageRef = useRef<string | undefined>(undefined);
 
   const [partnerPort, setPartnerPort] = useState<number | null>(null);
   const partnerAI = usePartnerAI(partnerPort);
@@ -150,6 +154,21 @@ export function usePartnerConversation(
     }
   }, []);
 
+  const captureVisualContext = useCallback(
+    async (
+      preferredCameraImageBase64?: string,
+    ): Promise<PartnerVisualContext> => {
+      const cameraImageBase64 = preferredCameraImageBase64 ?? captureImage?.();
+      const screenImageBase64 = await window.partner?.captureScreenImage?.();
+
+      return {
+        cameraImageBase64,
+        screenImageBase64,
+      };
+    },
+    [captureImage],
+  );
+
   const confirmConversationAction = useCallback(async () => {
     if (!window.partner?.confirmConversationAction) {
       onStatusChange("当前环境不支持会话确认执行，请使用桌面端。");
@@ -223,7 +242,8 @@ export function usePartnerConversation(
       }
 
       await dispatchConversationEvent({ type: "user.transcription.started" });
-      const sent = partnerAI.sendText(text, captureImage?.());
+      const visualContext = await captureVisualContext();
+      const sent = partnerAI.sendText(text, visualContext, gaze);
       if (!sent) {
         throw new Error("Python Partner 服务暂时不可用，请稍后重试。");
       }
@@ -236,8 +256,9 @@ export function usePartnerConversation(
       clearConversationConfirmation,
       confirmConversationAction,
       conversationSnapshot.pendingConfirmation,
-      captureImage,
+      captureVisualContext,
       dispatchConversationEvent,
+      gaze,
       onStatusChange,
       partnerAI,
     ],
@@ -271,28 +292,41 @@ export function usePartnerConversation(
         try {
           conversationAudioSessionRef.current =
             await startContinuousAudioSession({
-              vadConfig: getDefaultVadConfig(),
+              vadConfig: () =>
+                getConversationVadConfig(conversationPhaseRef.current),
               onSpeechStart: () => {
                 const phase = conversationPhaseRef.current;
                 const decision = getSpeechStartDecision(phase);
                 conversationUtteranceAcceptedRef.current = decision.accepted;
+                speechStartCameraImageRef.current = decision.accepted
+                  ? captureImage?.()
+                  : undefined;
 
                 if (decision.shouldInterruptAssistant) {
                   const currentPartnerAI = partnerAIRef.current;
-                  if (
-                    currentPartnerAI.isConnected &&
-                    currentPartnerAI.isPlaying
-                  ) {
-                    currentPartnerAI.interrupt();
-                  } else {
-                    void window.partner?.interruptConversation("barge-in");
-                  }
+                  void (async () => {
+                    if (currentPartnerAI.isConnected) {
+                      currentPartnerAI.interrupt();
+                    }
+
+                    const snapshot =
+                      await window.partner?.interruptConversation?.("barge-in");
+                    if (snapshot) {
+                      setConversationSnapshot(snapshot);
+                    }
+
+                    await dispatchConversationEvent({
+                      type: "user.speech.started",
+                    });
+                  })();
+                  onStatusChange("听到你说话，已暂停播报并开始收音。");
+                  return;
                 }
 
                 if (!decision.accepted) {
                   onStatusChange(
                     phase === "speaking"
-                      ? "助手正在播报，已忽略麦克风回声；需要打断时请点“打断播报”。"
+                      ? "助手正在播报，已忽略可能的扬声器回声。"
                       : "当前上一轮仍在处理中，新的短句会被忽略。",
                   );
                   return;
@@ -306,6 +340,7 @@ export function usePartnerConversation(
                   !conversationUtteranceAcceptedRef.current ||
                   decision === "discard"
                 ) {
+                  speechStartCameraImageRef.current = undefined;
                   if (!conversationUtteranceAcceptedRef.current) {
                     return;
                   }
@@ -322,26 +357,37 @@ export function usePartnerConversation(
                   type: "user.transcription.started",
                 });
 
-                const currentPartnerAI = partnerAIRef.current;
-                if (currentPartnerAI.isConnected) {
-                  const sent = currentPartnerAI.sendTurn(
-                    audioBlob,
-                    captureImage?.(),
-                  );
-                  if (sent) {
-                    onStatusChange("已发送语音至 Python Partner，等待响应。");
-                    return;
+                void (async () => {
+                  const currentPartnerAI = partnerAIRef.current;
+                  if (currentPartnerAI.isConnected) {
+                    const speechStartCameraImageBase64 =
+                      speechStartCameraImageRef.current;
+                    speechStartCameraImageRef.current = undefined;
+                    const visualContext = await captureVisualContext(
+                      speechStartCameraImageBase64,
+                    );
+                    const sent = currentPartnerAI.sendTurn(
+                      audioBlob,
+                      visualContext,
+                      gaze,
+                    );
+                    if (sent) {
+                      onStatusChange(
+                        "已发送语音、摄像头和屏幕内容至 Python Partner，等待响应。",
+                      );
+                      return;
+                    }
                   }
-                }
 
-                void dispatchConversationEvent({
-                  type: "user.turn.discarded",
-                  reason:
+                  await dispatchConversationEvent({
+                    type: "user.turn.discarded",
+                    reason:
+                      "Python Partner 服务尚未连接，请稍等模型加载完成后重试。",
+                  });
+                  onStatusChange(
                     "Python Partner 服务尚未连接，请稍等模型加载完成后重试。",
-                });
-                onStatusChange(
-                  "Python Partner 服务尚未连接，请稍等模型加载完成后重试。",
-                );
+                  );
+                })();
               },
               onError: (error) => {
                 onStatusChange(getLocalSpeechRecognitionErrorMessage(error));
@@ -370,8 +416,10 @@ export function usePartnerConversation(
   }, [
     canStreamConversation,
     captureImage,
+    captureVisualContext,
     conversationSnapshot.isActive,
     dispatchConversationEvent,
+    gaze,
     isStartingConversation,
     onStatusChange,
     stopConversationAudioSession,
@@ -395,21 +443,6 @@ export function usePartnerConversation(
       onStatusChange(error instanceof Error ? error.message : "停止会话失败。");
     }
   }, [onStatusChange, stopConversationAudioSession]);
-
-  const interruptConversation = useCallback(async () => {
-    if (!window.partner?.interruptConversation) {
-      onStatusChange("当前环境不支持会话桥接，请使用桌面端。");
-      return;
-    }
-
-    try {
-      const snapshot = await window.partner.interruptConversation("manual");
-      setConversationSnapshot(snapshot);
-      onStatusChange("已发送打断指令。");
-    } catch (error) {
-      onStatusChange(error instanceof Error ? error.message : "打断失败。");
-    }
-  }, [onStatusChange]);
 
   const submitConversationInput = useCallback(async () => {
     const text = conversationInput.trim();
@@ -442,7 +475,6 @@ export function usePartnerConversation(
     confirmConversationAction,
     conversationInput,
     conversationSnapshot,
-    interruptConversation,
     isStartingConversation,
     isTranscribing,
     lastAutomationResult,

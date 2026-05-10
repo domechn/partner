@@ -2,7 +2,7 @@
  * usePartnerAI — React hook that connects to the Python Partner server.
  *
  * Protocol:
- *   Client → Server:  { audio: base64WAV16k, image?: base64JPEG, gaze?: {x,y} }
+ *   Client → Server:  { audio: base64WAV16k, image?: base64JPEG, screen_image?: base64JPEG, gaze?: {x,y} }
  *   Client → Server:  { type: "interrupt" }
  *   Server → Client:  { type: "text", transcription?, text, llm_time }
  *   Server → Client:  { type: "audio_start", sample_rate, sentence_count }
@@ -86,26 +86,62 @@ export type PartnerAIClient = {
   /**
    * Send a completed speech turn to the Python server.
    * @param audioBlob  MediaRecorder blob (WebM/ogg) — resampled internally to WAV 16kHz.
-   * @param imageBase64  Optional JPEG frame from the user's camera.
+   * @param visualContext  Optional camera/screen frames for vision grounding.
    * @param gaze  Optional normalised gaze point {x, y} in [0, 1].
    */
   sendTurn: (
     audioBlob: Blob,
-    imageBase64?: string,
+    visualContext?: PartnerVisualContext,
     gaze?: { x: number; y: number },
   ) => boolean;
   /** Send a typed turn to the Python server. */
-  sendText: (text: string, imageBase64?: string) => boolean;
+  sendText: (
+    text: string,
+    visualContext?: PartnerVisualContext,
+    gaze?: PartnerGazePoint,
+  ) => boolean;
   /** Stop audio playback and signal the server to abort its response. */
   interrupt: () => void;
 };
 
-const BARGE_IN_GRACE_MS = 800;
+export type PartnerVisualContext = {
+  cameraImageBase64?: string;
+  screenImageBase64?: string;
+};
+
+export type PartnerGazePoint = {
+  x: number;
+  y: number;
+};
 
 type PendingUserTurn = {
   fallbackTranscript: string;
-  imageBase64?: string;
+  cameraImageBase64?: string;
+  screenImageBase64?: string;
 };
+
+export function buildTextTurnPayload(
+  text: string,
+  visualContext?: PartnerVisualContext,
+  gaze?: PartnerGazePoint,
+) {
+  const payload: {
+    text: string;
+    image?: string;
+    screen_image?: string;
+    gaze?: PartnerGazePoint;
+  } = { text };
+  if (visualContext?.cameraImageBase64) {
+    payload.image = visualContext.cameraImageBase64;
+  }
+  if (visualContext?.screenImageBase64) {
+    payload.screen_image = visualContext.screenImageBase64;
+  }
+  if (gaze) {
+    payload.gaze = gaze;
+  }
+  return payload;
+}
 
 export function usePartnerAI(serverPort: number | null): PartnerAIClient {
   const wsRef = useRef<WebSocket | null>(null);
@@ -117,7 +153,6 @@ export function usePartnerAI(serverPort: number | null): PartnerAIClient {
   const sampleRateRef = useRef(24_000);
   const nextPlayTimeRef = useRef(0);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const speakingStartedAtRef = useRef(0);
   const pendingChunksRef = useRef<string[]>([]);
   const pendingUserTurnRef = useRef<PendingUserTurn | null>(null);
 
@@ -233,7 +268,8 @@ export function usePartnerAI(serverPort: number | null): PartnerAIClient {
           void window.partner?.submitPartnerResponse(
             transcription || pendingUserTurn?.fallbackTranscript || "",
             text,
-            pendingUserTurn?.imageBase64,
+            pendingUserTurn?.cameraImageBase64,
+            pendingUserTurn?.screenImageBase64,
           );
         } else if (msg.type === "audio_start") {
           sampleRateRef.current = (msg.sample_rate as number) ?? 24_000;
@@ -241,7 +277,6 @@ export function usePartnerAI(serverPort: number | null): PartnerAIClient {
           ensureAudioCtx();
           nextPlayTimeRef.current =
             (audioCtxRef.current?.currentTime ?? 0) + 0.05;
-          speakingStartedAtRef.current = Date.now();
           setIsPlaying(true);
         } else if (msg.type === "audio_chunk") {
           queueChunk(msg.audio as string);
@@ -273,7 +308,7 @@ export function usePartnerAI(serverPort: number | null): PartnerAIClient {
   const sendTurn = useCallback(
     (
       audioBlob: Blob,
-      imageBase64?: string,
+      visualContext?: PartnerVisualContext,
       gaze?: { x: number; y: number },
     ) => {
       const ws = wsRef.current;
@@ -281,14 +316,20 @@ export function usePartnerAI(serverPort: number | null): PartnerAIClient {
 
       pendingUserTurnRef.current = {
         fallbackTranscript: "（语音输入）",
-        imageBase64,
+        cameraImageBase64: visualContext?.cameraImageBase64,
+        screenImageBase64: visualContext?.screenImageBase64,
       };
 
       void audioBlobToWav16kBase64(audioBlob)
         .then((wavBase64) => {
           if (ws.readyState !== WebSocket.OPEN) return;
           const payload: Record<string, unknown> = { audio: wavBase64 };
-          if (imageBase64) payload.image = imageBase64;
+          if (visualContext?.cameraImageBase64) {
+            payload.image = visualContext.cameraImageBase64;
+          }
+          if (visualContext?.screenImageBase64) {
+            payload.screen_image = visualContext.screenImageBase64;
+          }
           if (gaze) payload.gaze = gaze;
           ws.send(JSON.stringify(payload));
         })
@@ -305,23 +346,30 @@ export function usePartnerAI(serverPort: number | null): PartnerAIClient {
     [],
   );
 
-  const sendText = useCallback((text: string, imageBase64?: string) => {
-    const trimmed = text.trim();
-    const ws = wsRef.current;
-    if (!trimmed || !ws || ws.readyState !== WebSocket.OPEN) return false;
+  const sendText = useCallback(
+    (
+      text: string,
+      visualContext?: PartnerVisualContext,
+      gaze?: PartnerGazePoint,
+    ) => {
+      const trimmed = text.trim();
+      const ws = wsRef.current;
+      if (!trimmed || !ws || ws.readyState !== WebSocket.OPEN) return false;
 
-    pendingUserTurnRef.current = {
-      fallbackTranscript: trimmed,
-      imageBase64,
-    };
-    ws.send(JSON.stringify({ text: trimmed }));
-    return true;
-  }, []);
+      pendingUserTurnRef.current = {
+        fallbackTranscript: trimmed,
+        cameraImageBase64: visualContext?.cameraImageBase64,
+        screenImageBase64: visualContext?.screenImageBase64,
+      };
+      ws.send(
+        JSON.stringify(buildTextTurnPayload(trimmed, visualContext, gaze)),
+      );
+      return true;
+    },
+    [],
+  );
 
   const interrupt = useCallback(() => {
-    // Ignore barge-in triggers right after TTS starts (likely echo)
-    if (Date.now() - speakingStartedAtRef.current < BARGE_IN_GRACE_MS) return;
-
     stopPlayback();
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {

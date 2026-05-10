@@ -33,7 +33,9 @@ declare global {
         transcript: string,
         response: string,
         imageBase64?: string,
+        screenImageBase64?: string,
       ) => Promise<ConversationSnapshot>;
+      captureScreenImage: () => Promise<string | undefined>;
       partnerTtsCompleted: () => Promise<ConversationSnapshot>;
       partnerGetServerPort: () => Promise<number | null>;
       onConversationUpdate: (

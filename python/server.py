@@ -26,6 +26,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from request_content import build_user_content
 import tts
 
 HF_REPO = "litert-community/gemma-4-E2B-it-litert-lm"
@@ -47,14 +48,19 @@ MODEL_PATH = resolve_model_path()
 SYSTEM_PROMPT = (
     "你是 Partner 的本地语音助手。"
     "默认使用简洁中文回答，如果用户用英文说话则用英文回答。"
-    "用户正在通过麦克风与你对话，并可能向你展示摄像头画面。"
-    "如果消息中包含注视点坐标，请结合画面内容理解用户的关注点。"
+    "用户正在通过麦克风与你对话，并可能向你展示摄像头画面或电脑屏幕。"
+    "如果用户说这个、那个、这里、我指的或它，请优先结合视觉画面和注视点定位具体对象。"
+    "能看清时要直接说出对象名称和可见特征；看不清时要说明看不清和需要用户如何调整。"
+    "不要在用户已经提出问题时泛泛反问“你想让我做什么”。"
     "你必须始终使用 respond_to_user 工具来回复。"
     "先精确转录用户所说的内容，再给出你的回应（1-4句简洁回答）。"
     " / "
     "You are Partner's local voice assistant. "
     "Reply in the same language the user speaks. "
-    "The user is talking through a microphone and may be showing their camera. "
+    "The user is talking through a microphone and may provide camera or screen images. "
+    "When the user says this, that, here, what I am pointing at, or it, ground the reference in the visual inputs and gaze point. "
+    "If visible, directly name the object and describe visible features; if unclear, say what is unclear and how the user should adjust. "
+    "Do not ask what the user wants when they already asked a question. "
     "You MUST always use the respond_to_user tool to reply. "
     "First transcribe exactly what the user said, then write your response."
 )
@@ -151,32 +157,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             interrupted.clear()
 
-            content = []
-            has_audio = bool(msg.get("audio"))
-            has_image = bool(msg.get("image"))
-            has_gaze = "gaze" in msg
-
-            if has_audio:
-                content.append({"type": "audio", "blob": msg["audio"]})
-            if has_image:
-                content.append({"type": "image", "blob": msg["image"]})
-
-            if has_audio and has_image:
-                gaze_hint = ""
-                if has_gaze:
-                    g = msg["gaze"]
-                    gaze_hint = f" The user is looking at approximately ({g.get('x', 0.5):.2f}, {g.get('y', 0.5):.2f}) on screen."
-                content.append({
-                    "type": "text",
-                    "text": f"用户刚刚通过语音向你说话（audio），同时展示了摄像头画面（image）。{gaze_hint}请回应用户说的内容，如相关可结合画面。"
-                    f" / The user just spoke (audio) while showing their camera (image).{gaze_hint} Respond to what they said, referencing what you see if relevant.",
-                })
-            elif has_audio:
-                content.append({"type": "text", "text": "用户刚刚通过语音向你说话，请回应。 / The user just spoke to you. Respond to what they said."})
-            elif has_image:
-                content.append({"type": "text", "text": "用户向你展示了摄像头画面，请描述你看到的内容。 / The user is showing you their camera. Describe what you see."})
-            else:
-                content.append({"type": "text", "text": msg.get("text", "你好！ / Hello!")})
+            content = build_user_content(msg)
 
             # LLM inference
             t0 = time.time()
