@@ -1,0 +1,18 @@
+[project]
+name = "partner-server"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "On-device multimodal AI server for Partner (Gemma 4 E2B + Kokoro TTS)"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "litert-lm>=0.1",
+    "huggingface-hub>=0.24",
+    "numpy>=1.26",
+    "kokoro-onnx",
+]
+
+[tool.uv]
+# This project is a collection of scripts, not an installable library.
+# Tell uv not to build/install the project itself — just manage dependencies.
+package = false

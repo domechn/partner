@@ -84,7 +84,9 @@ test("streams assistant reply deltas through the manager", async () => {
 
   const finalSnapshot = await manager.streamAssistantReply();
 
-  assert.equal(finalSnapshot.phase, "listening");
+  // Phase remains "speaking" until the TTS player finishes and dispatches
+  // assistant.tts.completed — that transition is handled in main.mts.
+  assert.equal(finalSnapshot.phase, "speaking");
   assert.equal(finalSnapshot.turns.length, 2);
   assert.equal(finalSnapshot.turns[1]?.role, "assistant");
   assert.equal(finalSnapshot.turns[1]?.status, "complete");

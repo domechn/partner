@@ -29,6 +29,13 @@ declare global {
       dispatchConversationEvent: (
         event: RendererConversationEvent,
       ) => Promise<ConversationSnapshot>;
+      submitPartnerResponse: (
+        transcript: string,
+        response: string,
+        imageBase64?: string,
+      ) => Promise<ConversationSnapshot>;
+      partnerTtsCompleted: () => Promise<ConversationSnapshot>;
+      partnerGetServerPort: () => Promise<number | null>;
       onConversationUpdate: (
         listener: (update: ConversationUpdate) => void,
       ) => () => void;

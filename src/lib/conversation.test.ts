@@ -90,11 +90,25 @@ test("streams assistant deltas into a single speaking turn", () => {
     { type: "assistant.turn.completed" },
   ]);
 
-  assert.equal(next.phase, "listening");
+  assert.equal(next.phase, "speaking");
   assert.equal(next.turns.length, 2);
   assert.equal(next.turns[1]?.role, "assistant");
   assert.equal(next.turns[1]?.status, "complete");
   assert.equal(next.turns[1]?.text, "你好，我在。");
+});
+
+test("returns to listening once TTS finishes playing after assistant turn", () => {
+  const next = applyEvents([
+    { type: "session.started" },
+    { type: "user.turn.committed", text: "你好" },
+    { type: "assistant.turn.started" },
+    { type: "assistant.turn.delta", delta: "你好，我在。" },
+    { type: "assistant.turn.completed" },
+    { type: "assistant.tts.completed" },
+  ]);
+
+  assert.equal(next.phase, "listening");
+  assert.equal(next.turns[1]?.status, "complete");
 });
 
 test("interrupts an active assistant turn and returns to listening", () => {

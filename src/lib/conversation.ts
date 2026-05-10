@@ -64,6 +64,7 @@ export type ConversationEvent =
   | { type: "assistant.turn.started" }
   | { type: "assistant.turn.delta"; delta: string }
   | { type: "assistant.turn.completed" }
+  | { type: "assistant.tts.completed" }
   | { type: "assistant.turn.interrupted"; reason: string }
   | { type: "assistant.turn.failed"; message: string }
   | {
@@ -190,7 +191,24 @@ export function reduceConversationSnapshot(
       };
     }
     case "assistant.turn.completed": {
-      return finalizeAssistantTurn(snapshot, "complete");
+      // Phase stays as "speaking" until TTS finishes playing (assistant.tts.completed).
+      const turns = ensureStreamingAssistantTurn(snapshot.turns);
+      const lastTurn = turns[turns.length - 1];
+      if (!lastTurn || lastTurn.role !== "assistant") {
+        return { ...snapshot, draftAssistantText: "" };
+      }
+      return {
+        ...snapshot,
+        phase: "speaking",
+        turns: [...turns.slice(0, -1), { ...lastTurn, status: "complete" }],
+        draftAssistantText: "",
+      };
+    }
+    case "assistant.tts.completed": {
+      return {
+        ...snapshot,
+        phase: snapshot.isActive ? "listening" : snapshot.phase,
+      };
     }
     case "assistant.turn.interrupted": {
       const finalized = finalizeAssistantTurn(snapshot, "interrupted");

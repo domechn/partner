@@ -7,7 +7,6 @@ import {
 } from "../lib/conversation";
 import { parseConversationControl } from "../lib/conversationControl";
 import { type AutomationResult } from "../lib/intent";
-import { transcribeAudioBlob } from "../lib/localSpeech";
 import { getSpeechStartDecision } from "./conversationSpeech.ts";
 import {
   canUseLocalSpeechRecognition,
@@ -18,6 +17,7 @@ import {
   type ContinuousAudioSession,
 } from "../lib/voice/continuousAudio";
 import { getDefaultVadConfig } from "../lib/voice/vad";
+import { usePartnerAI } from "./usePartnerAI.ts";
 
 export type UsePartnerConversationOptions = {
   captureImage?: () => string | undefined;
@@ -51,6 +51,10 @@ export function usePartnerConversation(
   const conversationPhaseRef = useRef<ConversationSnapshot["phase"]>("idle");
   const conversationUtteranceAcceptedRef = useRef(true);
 
+  const [partnerPort, setPartnerPort] = useState<number | null>(null);
+  const partnerAI = usePartnerAI(partnerPort);
+  const partnerAIRef = useRef(partnerAI);
+
   const [isStartingConversation, setIsStartingConversation] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcript, setTranscript] = useState("");
@@ -72,6 +76,22 @@ export function usePartnerConversation(
   useEffect(() => {
     conversationPhaseRef.current = conversationSnapshot.phase;
   }, [conversationSnapshot.phase]);
+
+  useEffect(() => {
+    partnerAIRef.current = partnerAI;
+  }, [partnerAI]);
+
+  useEffect(() => {
+    if (!window.partner?.partnerGetServerPort) return;
+    window.partner
+      .partnerGetServerPort()
+      .then((port) => {
+        if (port !== null) setPartnerPort(port);
+      })
+      .catch(() => {
+        /* server not available */
+      });
+  }, []);
 
   useEffect(() => {
     if (!window.partner?.getConversationSnapshot) {
@@ -196,17 +216,20 @@ export function usePartnerConversation(
         }
       }
 
-      if (!window.partner?.submitConversationTurn) {
-        throw new Error("当前环境不支持会话桥接，请使用桌面端。");
+      if (!partnerAI.isConnected) {
+        throw new Error(
+          "Python Partner 服务尚未连接，请稍等模型加载完成后重试。",
+        );
       }
 
-      const snapshot = await window.partner.submitConversationTurn(
-        text,
-        captureImage?.(),
-      );
-      setConversationSnapshot(snapshot);
+      await dispatchConversationEvent({ type: "user.transcription.started" });
+      const sent = partnerAI.sendText(text, captureImage?.());
+      if (!sent) {
+        throw new Error("Python Partner 服务暂时不可用，请稍后重试。");
+      }
+
       setLastAutomationResult(null);
-      onStatusChange(`已提交当前语音：${text}`);
+      onStatusChange(`已发送给 Python Partner：${text}`);
       return true;
     },
     [
@@ -214,7 +237,9 @@ export function usePartnerConversation(
       confirmConversationAction,
       conversationSnapshot.pendingConfirmation,
       captureImage,
+      dispatchConversationEvent,
       onStatusChange,
+      partnerAI,
     ],
   );
 
@@ -253,7 +278,15 @@ export function usePartnerConversation(
                 conversationUtteranceAcceptedRef.current = decision.accepted;
 
                 if (decision.shouldInterruptAssistant) {
-                  void window.partner?.interruptConversation("barge-in");
+                  const currentPartnerAI = partnerAIRef.current;
+                  if (
+                    currentPartnerAI.isConnected &&
+                    currentPartnerAI.isPlaying
+                  ) {
+                    currentPartnerAI.interrupt();
+                  } else {
+                    void window.partner?.interruptConversation("barge-in");
+                  }
                 }
 
                 if (!decision.accepted) {
@@ -284,38 +317,31 @@ export function usePartnerConversation(
                   return;
                 }
 
-                void (async () => {
-                  await dispatchConversationEvent({
-                    type: "user.transcription.started",
-                  });
-                  setIsTranscribing(true);
-                  onStatusChange("正在本地转写当前一句语音。");
+                // Partner AI mode: send raw audio to Python (no local STT)
+                void dispatchConversationEvent({
+                  type: "user.transcription.started",
+                });
 
-                  try {
-                    const text = await transcribeAudioBlob(audioBlob);
-                    setIsTranscribing(false);
-
-                    if (!text) {
-                      await dispatchConversationEvent({
-                        type: "user.turn.discarded",
-                        reason: "没有识别到清晰语音，继续监听。",
-                      });
-                      onStatusChange("没有识别到清晰语音，继续监听。");
-                      return;
-                    }
-
-                    await handleConversationUtterance(text);
-                  } catch (error) {
-                    setIsTranscribing(false);
-                    const message =
-                      getLocalSpeechRecognitionErrorMessage(error);
-                    await dispatchConversationEvent({
-                      type: "user.turn.discarded",
-                      reason: message,
-                    });
-                    onStatusChange(message);
+                const currentPartnerAI = partnerAIRef.current;
+                if (currentPartnerAI.isConnected) {
+                  const sent = currentPartnerAI.sendTurn(
+                    audioBlob,
+                    captureImage?.(),
+                  );
+                  if (sent) {
+                    onStatusChange("已发送语音至 Python Partner，等待响应。");
+                    return;
                   }
-                })();
+                }
+
+                void dispatchConversationEvent({
+                  type: "user.turn.discarded",
+                  reason:
+                    "Python Partner 服务尚未连接，请稍等模型加载完成后重试。",
+                });
+                onStatusChange(
+                  "Python Partner 服务尚未连接，请稍等模型加载完成后重试。",
+                );
               },
               onError: (error) => {
                 onStatusChange(getLocalSpeechRecognitionErrorMessage(error));
@@ -343,9 +369,9 @@ export function usePartnerConversation(
     }
   }, [
     canStreamConversation,
+    captureImage,
     conversationSnapshot.isActive,
     dispatchConversationEvent,
-    handleConversationUtterance,
     isStartingConversation,
     onStatusChange,
     stopConversationAudioSession,

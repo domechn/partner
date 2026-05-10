@@ -46,6 +46,24 @@ const api = {
   ): Promise<ConversationSnapshot> {
     return ipcRenderer.invoke("conversation:dispatch-event", event);
   },
+  submitPartnerResponse(
+    transcript: string,
+    response: string,
+    imageBase64?: string,
+  ): Promise<ConversationSnapshot> {
+    return ipcRenderer.invoke(
+      "conversation:partner-response",
+      transcript,
+      response,
+      imageBase64,
+    );
+  },
+  partnerTtsCompleted(): Promise<ConversationSnapshot> {
+    return ipcRenderer.invoke("partner:tts-completed");
+  },
+  partnerGetServerPort(): Promise<number | null> {
+    return ipcRenderer.invoke("partner:get-server-port");
+  },
   onConversationUpdate(listener: (update: ConversationUpdate) => void) {
     const wrapped = (
       _event: Electron.IpcRendererEvent,

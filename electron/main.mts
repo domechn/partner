@@ -11,22 +11,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createConversationManager } from "./conversation/manager.js";
-import {
-  createLocalTtsPlayer,
-  splitStreamingTextForSpeech,
-} from "./conversation/localTts.js";
-import { resolveOllamaAutomationRequest } from "./conversation/automationProposal.js";
-import { buildConversationSystemPrompt } from "./conversation/gazeContext.js";
-import { streamOllamaChatReply } from "./conversation/ollamaClient.js";
+import { startPartnerServer, stopPartnerServer } from "./partnerServer.js";
 import {
   buildGazeOverlayHtml,
   resolveGazeOverlayPoint,
 } from "./gazeOverlay.js";
 import { captureScreenImageBase64 } from "./screenCapture.js";
-import type {
-  ConversationUpdate,
-  RendererConversationEvent,
-} from "../src/lib/conversation.js";
+import type { RendererConversationEvent } from "../src/lib/conversation.js";
 import type {
   AutomationAction,
   AutomationPlanStep,
@@ -42,50 +33,8 @@ let mainWindow: BrowserWindow | null = null;
 let gazeOverlayWindow: BrowserWindow | null = null;
 let latestGaze: GazePoint = { x: 0.5, y: 0.5 };
 let pendingConfirmation: AutomationRequest | null = null;
-let ttsRemainder = "";
 
-const conversationConfig = {
-  baseUrl: process.env.PARTNER_OLLAMA_BASE_URL || "http://127.0.0.1:11434",
-  model: process.env.PARTNER_OLLAMA_MODEL || "qwen3-vl:4b",
-  allowInstalledModelFallback: !process.env.PARTNER_OLLAMA_MODEL,
-  systemPrompt:
-    process.env.PARTNER_SYSTEM_PROMPT ||
-    [
-      "你是 Partner 的本地语音助手。",
-      "默认使用简洁中文回答。",
-      "你会收到用户最近的摄像头画面和电脑屏幕截图；当用户询问画面、屏幕、软件、这里、这个或我指的内容时，请结合图像和注视点回答。",
-      "当前版本先专注于实时对话；涉及电脑操作时先解释意图，不要假装已经执行。",
-      "如果上下文不足，就先追问一个最小澄清问题。",
-    ].join(""),
-};
-
-const conversationManager = createConversationManager({
-  createReplyStream: ({ snapshot }, signal) =>
-    streamOllamaChatReply(snapshot, {
-      ...conversationConfig,
-      systemPrompt: buildConversationSystemPrompt(
-        conversationConfig.systemPrompt,
-        latestGaze,
-      ),
-      signal,
-      allowLocalReplyFallback: true,
-    }),
-  createAutomationProposal: async ({ snapshot }) => {
-    const request = await resolveOllamaAutomationRequest(snapshot, {
-      model: conversationConfig.model,
-      baseUrl: conversationConfig.baseUrl,
-      gaze: latestGaze,
-    });
-
-    return buildConversationConfirmation(request);
-  },
-});
-
-const ttsPlayer = createLocalTtsPlayer({
-  onError: (error) => {
-    console.error("Partner local TTS failed:", error);
-  },
-});
+const conversationManager = createConversationManager();
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
 
@@ -93,7 +42,6 @@ const riskyActions = new Set<AutomationRequest["kind"]>(["open_app"]);
 
 conversationManager.onUpdate((update) => {
   mainWindow?.webContents.send("conversation:update", update);
-  handleConversationTts(update);
 });
 
 const verifyPartnerBridge = async (window: BrowserWindow) => {
@@ -188,6 +136,11 @@ app.whenReady().then(async () => {
   await createWindow();
   await createGazeOverlayWindow();
 
+  // Start the Python Partner server in the background; resolve port when ready.
+  startPartnerServer().catch((err) => {
+    console.error("[python] Could not start Partner server:", err);
+  });
+
   app.on("activate", async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       await createWindow();
@@ -200,6 +153,10 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("will-quit", () => {
+  stopPartnerServer();
 });
 
 ipcMain.handle("gaze:update", (_event, point: GazePoint) => {
@@ -216,8 +173,6 @@ ipcMain.handle("conversation:start", () => {
 });
 
 ipcMain.handle("conversation:stop", (_event, reason?: string) => {
-  ttsRemainder = "";
-  void ttsPlayer.stop(reason);
   return conversationManager.stopSession(reason);
 });
 
@@ -225,19 +180,15 @@ ipcMain.handle(
   "conversation:submit-turn",
   async (_event, text: string, imageBase64?: string) => {
     const screenImageBase64 = await captureLatestScreenImageBase64();
-    const snapshot = conversationManager.submitUserTurn(
-      text,
-      imageBase64,
-      screenImageBase64,
-    );
-    void conversationManager.streamAssistantReply();
-    return snapshot;
+    conversationManager.submitUserTurn(text, imageBase64, screenImageBase64);
+    return conversationManager.dispatch({
+      type: "assistant.turn.failed",
+      message: "Python Partner 服务尚未接管这次输入，请等待服务连接后重试。",
+    });
   },
 );
 
 ipcMain.handle("conversation:interrupt", (_event, reason?: string) => {
-  ttsRemainder = "";
-  void ttsPlayer.stop(reason);
   return conversationManager.interruptConversation(reason);
 });
 
@@ -340,6 +291,47 @@ ipcMain.handle(
     }
   },
 );
+
+ipcMain.handle("partner:get-server-port", () => {
+  return startPartnerServer();
+});
+
+ipcMain.handle(
+  "conversation:partner-response",
+  async (
+    _event,
+    transcript: string,
+    response: string,
+    imageBase64?: string,
+  ) => {
+    const userText = transcript.trim() || "（语音输入）";
+    const assistantText = response.trim();
+
+    if (!assistantText) {
+      return conversationManager.dispatch({
+        type: "assistant.turn.failed",
+        message: "Python Partner 服务没有返回可显示的回复。",
+      });
+    }
+
+    conversationManager.submitUserTurn(userText, imageBase64);
+    conversationManager.dispatch({ type: "assistant.turn.started" });
+    conversationManager.dispatch({
+      type: "assistant.turn.delta",
+      delta: assistantText,
+    });
+    // assistant.turn.completed sets phase to "speaking"; the renderer will
+    // call partner:tts-completed when audio playback ends to advance to "listening".
+    return conversationManager.dispatch({ type: "assistant.turn.completed" });
+  },
+);
+
+ipcMain.handle("partner:tts-completed", () => {
+  if (conversationManager.getSnapshot().phase === "speaking") {
+    return conversationManager.dispatch({ type: "assistant.tts.completed" });
+  }
+  return conversationManager.getSnapshot();
+});
 
 async function runAutomation(
   activeWindow: BrowserWindow,
@@ -640,78 +632,6 @@ function sanitizeTypedText(text: string): string {
   return text
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
     .slice(0, 200);
-}
-
-function buildConversationConfirmation(request: AutomationRequest | null) {
-  if (!request) {
-    return null;
-  }
-
-  switch (request.kind) {
-    case "click_here":
-      return {
-        request,
-        message: "我理解为要在当前注视点附近点击；确认后才会执行。",
-      };
-    case "switch_tab":
-      return {
-        request,
-        message: "我理解为要切换到下一个标签页；确认后才会执行。",
-      };
-    case "type_text":
-      return {
-        request,
-        message: `我理解为要输入文本“${request.text}”；确认后才会执行。`,
-      };
-    case "open_app":
-      return {
-        request,
-        message: `我理解为要打开“${request.appName}”；确认后才会执行。`,
-      };
-    case "agent_task":
-      return {
-        request,
-        message: `我理解为要执行“${request.goal}”；确认后才会开始操作。`,
-        plan: createAgentPlan(request.goal),
-      };
-    case "confirm_pending":
-      return null;
-    default:
-      return null;
-  }
-}
-
-function handleConversationTts(update: ConversationUpdate): void {
-  switch (update.event.type) {
-    case "assistant.turn.delta": {
-      const next = splitStreamingTextForSpeech(
-        `${ttsRemainder}${update.event.delta}`,
-      );
-      ttsRemainder = next.remainder;
-      for (const chunk of next.chunks) {
-        ttsPlayer.enqueue(chunk);
-      }
-      break;
-    }
-    case "assistant.turn.completed": {
-      if (ttsRemainder.trim()) {
-        ttsPlayer.enqueue(ttsRemainder);
-      }
-      ttsRemainder = "";
-      break;
-    }
-    case "assistant.turn.failed":
-    case "assistant.turn.interrupted":
-    case "session.started":
-    case "session.stopped":
-    case "user.speech.started": {
-      ttsRemainder = "";
-      void ttsPlayer.stop(update.event.type);
-      break;
-    }
-    default:
-      break;
-  }
 }
 
 function normalizeGazePoint(point: GazePoint): GazePoint {
