@@ -38,6 +38,8 @@ Partner 是一个本地运行的桌面助手原型，目标是让用户可以一
 
 ## 本地运行
 
+请先安装 Node.js、Python 和 `uv`，然后执行：
+
 ```bash
 npm install
 cd python && uv sync && cd ..
