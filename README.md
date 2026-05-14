@@ -38,7 +38,7 @@ Partner 是一个本地运行的桌面助手原型，目标是让用户可以一
 
 ## 本地运行
 
-请先安装 Node.js、Python 和 `uv`（Python 包管理工具，可参考 https://docs.astral.sh/uv/getting-started/installation/ ），然后执行：
+请先安装 Node.js、Python 和 `uv`（用于安装本项目的 Python 依赖，可参考 https://docs.astral.sh/uv/getting-started/installation/），然后执行：
 
 ```bash
 npm install
@@ -47,5 +47,5 @@ npm run dev
 ```
 
 启动后按界面提示完成摄像头校准即可开始使用。
-首次运行 Python 服务时会准备本地模型，可能需要多等一会儿。
+首次运行 Python 服务时会准备本地模型，可能需要等待几分钟。
 若在 macOS 上首次运行，可能需要授予摄像头或屏幕录制权限。
